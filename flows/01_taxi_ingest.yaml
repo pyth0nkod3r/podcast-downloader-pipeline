@@ -30,7 +30,7 @@ tasks:
   - id: set_label
     type: io.kestra.plugin.core.execution.Labels
     labels:
-      files: "{{render(vars.file}}"
+      files: "{{render(vars.file)}}"
       taxi: "{{inputs.taxi}}"
 
   - id: extract
@@ -38,14 +38,17 @@ tasks:
     outputFiles:
       - "*.csv"
     taskRunner:
-      type: io.kestra.plugin.core.runner.
+      type: io.kestra.plugin.core.runner.Process
     commands:
-      - wget -qO https://github.com/DataTalksClub/nyc-tlc-data/releases/download/{{inputs.taxi}}/{{render(vars.file)}}.gz | gunzip > {{render(vars.file}}
+        # Install wget first
+      - apt install -y wget
+        # Download and unzip
+      - wget -qO - https://github.com/DataTalksClub/nyc-tlc-data/releases/download/{{inputs.taxi}}/{{render(vars.file)}}.gz | gunzip > {{render(vars.file)}}
 
   - id: green_create_table
-    type: io.kestra.plugin.jbdc.postgresql.Queries
+    type: io.kestra.plugin.jdbc.postgresql.Queries
     sql: |
-      CREATE TABLE IF NOT EXITS {{render(vars.table)}} (
+      CREATE TABLE IF NOT EXISTS {{render(vars.table)}} (
       unique_row_id          text,
       filename               text,
       VendorID               text,
