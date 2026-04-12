@@ -17,7 +17,8 @@ inputs:
   - id: month
     type: SELECT
     displayName: Select month
-    values: ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]
+    values:
+      ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]
     defaults: "01"
 
 variables:
@@ -40,7 +41,7 @@ tasks:
     taskRunner:
       type: io.kestra.plugin.core.runner.Process
     commands:
-        # Install wget first
+      # Install wget first
       - apt install -y wget
         # Download and unzip
       - wget -qO - https://github.com/DataTalksClub/nyc-tlc-data/releases/download/{{inputs.taxi}}/{{render(vars.file)}}.gz | gunzip > {{render(vars.file)}}
@@ -49,27 +50,62 @@ tasks:
     type: io.kestra.plugin.jdbc.postgresql.Queries
     sql: |
       CREATE TABLE IF NOT EXISTS {{render(vars.table)}} (
-      unique_row_id          text,
-      filename               text,
-      VendorID               text,
-      tpep_pickup_datetime   timestamp,
-      tpep_dropoff_datetime  timestamp,
-      passenger_count        integer,
-      trip_distance          double precision,
-      RatecodeID             text,
-      store_and_fwd_flag      text,
-      PULocationID           text,
-      DOLocationID           text,
-      payment_type           integer,
-      fare_amount            double precision,
-      extra                  double precision,
-      mta_tax                double precision,
-      tip_amount             double precision,
-      tolls_amount           double precision,
-      improvement_surcharge  double precision,
-      total_amount           double precision,
-      congestion_surcharge   double precision
-      );
+              unique_row_id          text,
+              filename               text,
+              VendorID               text,
+              lpep_pickup_datetime   timestamp,
+              lpep_dropoff_datetime  timestamp,
+              store_and_fwd_flag     text,
+              RatecodeID             text,
+              PULocationID           text,
+              DOLocationID           text,
+              passenger_count        integer,
+              trip_distance          double precision,
+              fare_amount            double precision,
+              extra                  double precision,
+              mta_tax                double precision,
+              tip_amount             double precision,
+              tolls_amount           double precision,
+              ehail_fee              double precision,
+              improvement_surcharge  double precision,
+              total_amount           double precision,
+              payment_type           integer,
+              trip_type              integer,
+              congestion_surcharge   double precision
+          );
+
+  - id: green_create_staging_table
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
+      CREATE TABLE IF NOT EXISTS {{render(vars.table)}} (
+              unique_row_id          text,
+              filename               text,
+              VendorID               text,
+              lpep_pickup_datetime   timestamp,
+              lpep_dropoff_datetime  timestamp,
+              store_and_fwd_flag     text,
+              RatecodeID             text,
+              PULocationID           text,
+              DOLocationID           text,
+              passenger_count        integer,
+              trip_distance          double precision,
+              fare_amount            double precision,
+              extra                  double precision,
+              mta_tax                double precision,
+              tip_amount             double precision,
+              tolls_amount           double precision,
+              ehail_fee              double precision,
+              improvement_surcharge  double precision,
+              total_amount           double precision,
+              payment_type           integer,
+              trip_type              integer,
+              congestion_surcharge   double precision
+          );
+
+  - id: green_truncate_staging_table
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
+      TRUNCATE TABLE {{render(vars.staging_table)}};
 
 pluginDefaults:
   - type: io.kestra.plugin.jdbc.postgresql

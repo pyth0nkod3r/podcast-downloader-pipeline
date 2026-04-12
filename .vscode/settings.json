@@ -1,0 +1,6 @@
+{
+    "specstory.cloudSync.enabled": "always",
+    "editor.wordWrap": "on",
+    "editor.formatOnPaste": true,
+    "editor.defaultFormatter": "redhat.vscode-yaml"
+}

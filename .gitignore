@@ -1,5 +1,5 @@
-.specstory
-.vscode
-.env
-.env.encoded
-.env_encoded
+//.specstory
+//.vscode
+//.env
+//.env.encoded
+//.env_encoded
