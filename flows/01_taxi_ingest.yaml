@@ -84,6 +84,8 @@ tasks:
         type: io.kestra.plugin.jdbc.postgresql.Queries
         sql: |
           CREATE TABLE IF NOT EXISTS {{render(vars.staging_table)}} (
+              unique_row_id          text,
+              filename               text,
               VendorID               text,
               lpep_pickup_datetime   timestamp,
               lpep_dropoff_datetime  timestamp,
@@ -206,7 +208,9 @@ tasks:
       - id: yellow_create_staging_table
         type: io.kestra.plugin.jdbc.postgresql.Queries
         sql: |
-          CREATE TABLE IF NOT EXISTS {{render(vars.staging_table)}} (          
+          CREATE TABLE IF NOT EXISTS {{render(vars.staging_table)}} (
+              unique_row_id          text,
+              filename               text,          
               VendorID               text,
               tpep_pickup_datetime   timestamp,
               tpep_dropoff_datetime  timestamp,
