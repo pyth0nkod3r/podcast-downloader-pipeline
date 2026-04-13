@@ -49,7 +49,7 @@ tasks:
       - wget -qO - https://github.com/DataTalksClub/nyc-tlc-data/releases/download/{{inputs.taxi}}/{{render(vars.file)}}.gz | gunzip > {{render(vars.file)}}
 
   - id: if_green_table
-    type: io.ketra.plugin.core.flows.If
+    type: io.kestra.plugin.core.flow.If
     condition: "{{inputs.taxi == 'green'}}"
     then:
       - id: green_create_table
@@ -114,8 +114,8 @@ tasks:
       - id: green_copy_into_staging_table
         type: io.kestra.plugin.jdbc.postgresql.CopyIn
         format: CSV
-        from: { { render(vars.data) } }
-        table: { { render(vars.staging_table) } }
+        from: "{{ render(vars.data)}}"
+        table: "{{ render(vars.staging_table)}}"
         header: true
         columns:
           [
@@ -174,8 +174,8 @@ tasks:
           )
 
   - id: if_yellow_table
-    type: io.kestra.plugin.core.flows.If
-    condition: { { render(inputs.taxi == 'yellow') } }
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ render(inputs.taxi == 'yellow')}}"
     then:
       - id: yellow_create_table
         type: io.kestra.plugin.jdbc.postgresql.Queries
@@ -235,8 +235,8 @@ tasks:
       - id: yellow_copy_into_staging_table
         type: io.kestra.plugin.jdbc.postgresql.CopyIn
         format: CSV
-        from: { { render(vars.data) } }
-        table: { { (vars.staging_table } }
+        from: "{{ render(vars.data) }}"
+        table: "{{ render(vars.staging_table) }}"
         header: true
         columns:
           [
@@ -298,7 +298,7 @@ tasks:
 
   - id: purge_files
     type: io.kestra.plugin.core.storage.PurgeCurrentExecutionFiles
-    descriptiom: This will remove output files. If you'd like to explore Kestra outputs, disable it.
+    description: This will remove output files. If you'd like to explore Kestra outputs, disable it.
 
 pluginDefaults:
   - type: io.kestra.plugin.jdbc.postgresql
