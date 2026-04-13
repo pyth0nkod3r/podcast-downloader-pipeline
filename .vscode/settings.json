@@ -2,5 +2,8 @@
     "specstory.cloudSync.enabled": "always",
     "editor.wordWrap": "on",
     "editor.formatOnPaste": true,
-    "editor.defaultFormatter": "redhat.vscode-yaml"
+    "editor.defaultFormatter": "redhat.vscode-yaml",
+    "yaml.schemas": {
+        "kestra:/flow-schema.json": "file:///home/macmkboy/codes/podcast-downloader-pipeline/flows/01_taxi_ingest.yaml"
+    }
 }
