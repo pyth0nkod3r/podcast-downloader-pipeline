@@ -1,4 +1,6 @@
 volumes:
+  pgadmin_data:
+    driver: local
   ny_taxi_postgres_data:
     driver: local
   kestra_postgres_data:
@@ -28,6 +30,8 @@ services:
     environment:
       - PGADMIN_DEFAULT_EMAIL=${PGADMIN_USER}
       - PGADMIN_DEFAULT_PASSWORD=${PGADMIN_PASSWORD}
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
     ports:
       - "8085:80"
     depends_on:
