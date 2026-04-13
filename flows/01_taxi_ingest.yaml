@@ -38,6 +38,8 @@ tasks:
     type: io.kestra.plugin.scripts.shell.Commands
     outputFiles:
       - "*.csv"
+    taskCache:
+      enabled: true
     taskRunner:
       type: io.kestra.plugin.core.runner.Process
     commands:
@@ -293,6 +295,10 @@ tasks:
               S.DOLocationID, S.payment_type, S.fare_amount, S.extra, S.mta_tax, S.tip_amount, S.tolls_amount,
               S.improvement_surcharge, S.total_amount, S.congestion_surcharge
           )
+
+  - id: purge_files
+    type: io.kestra.plugin.core.storage.PurgeCurrentExecutionFiles
+    descriptiom: This will remove output files. If you'd like to explore Kestra outputs, disable it.
 
 pluginDefaults:
   - type: io.kestra.plugin.jdbc.postgresql
