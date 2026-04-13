@@ -83,7 +83,7 @@ tasks:
       - id: green_create_staging_table
         type: io.kestra.plugin.jdbc.postgresql.Queries
         sql: |
-          CREATE TABLE IF NOT EXISTS {{render(vars.table)}} (
+          CREATE TABLE IF NOT EXISTS {{render(vars.staging_table)}} (
               VendorID               text,
               lpep_pickup_datetime   timestamp,
               lpep_dropoff_datetime  timestamp,
