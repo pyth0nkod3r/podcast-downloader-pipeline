@@ -154,7 +154,7 @@ tasks:
               COALESCE(CAST(fare_amount AS text), '') || 
               COALESCE(CAST(trip_distance AS text), '')      
             ),
-            filename = {{render(vars.file)}}
+            filename = '{{render(vars.file)}}'
 
       - id: green_merge_data
         type: io.kestra.plugin.jdbc.postgresql.Queries
