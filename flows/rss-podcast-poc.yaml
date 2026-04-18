@@ -1,0 +1,8 @@
+id: rss-podcast-poc
+namespace: deeptech
+
+tasks:
+  - id: rss-fetch
+    type: io.kestra.plugin.core.http.Request
+    uri: https://anchor.fm/s/1cd48480/podcast/rss
+    method: GET

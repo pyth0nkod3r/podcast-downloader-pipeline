@@ -83,6 +83,7 @@ tasks:
       - id: green_create_staging_table
         type: io.kestra.plugin.jdbc.postgresql.Queries
         sql: |
+          DROP TABLE IF EXISTS {{render(vars.staging_table)}}
           CREATE TABLE IF NOT EXISTS {{render(vars.staging_table)}} (
               unique_row_id          text,
               filename               text,
@@ -182,6 +183,7 @@ tasks:
       - id: yellow_create_table
         type: io.kestra.plugin.jdbc.postgresql.Queries
         sql: |
+          DROP TABLE IF EXISTS {{render(vars.staging_table)}}
           CREATE TABLE IF NOT EXISTS {{render(vars.table)}} (
               unique_row_id          text,
               filename               text,
