@@ -2,7 +2,19 @@ id: rss-podcast-poc
 namespace: deeptech
 
 tasks:
-  - id: rss-fetch
-    type: io.kestra.plugin.core.http.Request
+  - id: rss_fetch
+    type: io.kestra.plugin.core.http.Download
     uri: https://anchor.fm/s/1cd48480/podcast/rss
     method: GET
+
+  - id: xml_to_ion
+    type: io.kestra.plugin.serdes.xml.XmlToIon
+    from: "{{outputs.rss_fetch.uri}}"
+  
+  - id: ion_to_json
+    type: io.kestra.plugin.serdes.json.IonToJson
+    from: "{{outputs.xml_to_ion.uri}}"
+
+  - id: extract_titles
+    type: io.kestra.plugin.core.debug.Return
+    format: "{{read(outputs.ion_to_json.uri) | jq('.rss.channel.item | map(.title)') |  flatten}}"
