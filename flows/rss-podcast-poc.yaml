@@ -1,20 +1,62 @@
 id: rss-podcast-poc
 namespace: deeptech
 
+inputs:
+  - id: rss_url
+    type: SELECT
+    displayName: Select rss feed
+    required: true
+    values: [ "commit_your_code", "tech_news", "simplecast_demo" ]
+    defaults: "commit_your_code"
+
+variables:
+  rss_mapping:
+    commit_your_code: https://anchor.fm/s/1cd48480/podcast/rss
+    tech_news: https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml
+    simplecast_demo: https://feeds.simplecast.com/54nAGcIl
+
 tasks:
   - id: rss_fetch
     type: io.kestra.plugin.core.http.Download
-    uri: https://anchor.fm/s/1cd48480/podcast/rss
+    uri: "{{vars.rss_mapping[inputs.rss_url]}}"
     method: GET
 
   - id: xml_to_ion
     type: io.kestra.plugin.serdes.xml.XmlToIon
     from: "{{outputs.rss_fetch.uri}}"
-  
+
   - id: ion_to_json
     type: io.kestra.plugin.serdes.json.IonToJson
     from: "{{outputs.xml_to_ion.uri}}"
 
-  - id: extract_titles
-    type: io.kestra.plugin.core.debug.Return
-    format: "{{read(outputs.ion_to_json.uri) | jq('.rss.channel.item | map(.title)') |  flatten}}"
+  - id: extract_podcasts
+    type: io.kestra.plugin.scripts.python.Script
+    inputFiles:
+      json_data.json: "{{outputs.ion_to_json.uri}}"
+    outputFiles:
+      - podcast_data.json
+    script: |
+      import json
+
+      with open("json_data.json", "r", encoding="utf-8") as f:
+        raw_json = json.load(f)
+      items = raw_json["rss"]["channel"]["item"]
+      result = [
+        {
+          "title": item.get("title"),
+          "link": item.get("link"),
+          "description": item.get("description"),
+          "duration": item.get("itunes:duration"),
+          "creator": item.get("dc:creator"),
+          "pubDate": item.get("pubDate"),
+          "guid": item.get("guid", {}).get("content")
+        }
+        for item in items
+      ]
+
+      print(json.dumps(result, indent=2))
+
+      with open("podcast_data.json", "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+
+      print("podcast_data.json created successfully")
