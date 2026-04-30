@@ -1,6 +1,6 @@
 volumes:
   pgadmin_data:
-    driver: local
+    # driver: local
   ny_taxi_postgres_data:
     driver: local
   kestra_postgres_data:

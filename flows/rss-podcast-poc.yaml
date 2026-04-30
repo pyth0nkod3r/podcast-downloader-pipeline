@@ -16,31 +16,47 @@ variables:
     simplecast_demo: https://feeds.simplecast.com/54nAGcIl
 
 tasks:
+  # Fetch rss
   - id: rss_fetch
     type: io.kestra.plugin.core.http.Download
     uri: "{{vars.rss_mapping[inputs.rss_url]}}"
     method: GET
 
+  # xml to ion
   - id: xml_to_ion
     type: io.kestra.plugin.serdes.xml.XmlToIon
     from: "{{outputs.rss_fetch.uri}}"
 
+  # ion to json
   - id: ion_to_json
     type: io.kestra.plugin.serdes.json.IonToJson
     from: "{{outputs.xml_to_ion.uri}}"
 
+  # extraction and transformation
   - id: extract_podcasts
     type: io.kestra.plugin.scripts.python.Script
     inputFiles:
       json_data.json: "{{outputs.ion_to_json.uri}}"
     outputFiles:
       - podcast_data.json
+      - podcast_history.json
     script: |
       import json
+      import os
 
       with open("json_data.json", "r", encoding="utf-8") as f:
         raw_json = json.load(f)
       items = raw_json["rss"]["channel"]["item"]
+
+      history_file = "podcast_history.json"
+      if os.path.exists(history_file) and os.path.getsize(history_file) > 0:
+        print("History file with content exists")
+        with open(history_file, "r") as f:
+          old_guids = set(json.load(f))
+      else:
+        print("No history file exists")
+        old_guids = set()
+
       result = [
         {
           "title": item.get("title"),
@@ -54,9 +70,69 @@ tasks:
         for item in items
       ]
 
-      print(json.dumps(result, indent=2))
+      new_episode = []
+      for ep in result:
+        if ep['guid'] and ep["guid"] not in old_guids:
+          new_episode.append(ep)
+
+      for ep in new_episode:
+        ep = ep["guid"]
+      old_guids.update(ep)
+
+      with open(history_file, "w") as file:
+        json.dump(list(old_guids), file, indent=2)
+
+      # print(items[0])
+      # print("Old GUIDs:", old_guids)
+      # print("Total episodes:", len(result))
+      # print("New episodes:", len(new_episode))
+      # print("New Episodes:", new_episode)
+
+
+      # print(json.dumps(result, indent=2))
 
       with open("podcast_data.json", "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
 
-      print("podcast_data.json created successfully")
+      # print("podcast_data.json created successfully")
+      print(f"Extracted {len(result)} episodes")
+
+  # Postgres
+  - id: store_podcasts
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
+      CREATE TABLE IF NOT EXISTS podcast_history (
+      id SERIAL PRIMARY KEY,
+      guid TEXT UNIQUE,
+      title TEXT,
+      link TEXT,
+      description TEXT,
+      duration TEXT,
+      creator TEXT,
+      pubDate TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+      )
+
+      INSERT INTO podcast_history (
+      guid,
+      title,
+      link,
+      description,
+      duration,
+      creator,
+      pubDate,
+      )
+
+      VALUES (
+      :guid,
+      :title,
+      :link,
+      :description,
+      :duration,
+      :creator,
+      :pubDate,
+      )
+
+      ON CONFLICT (guid) DO NOTHING
+
+      from: {{outputs.extract_podcasts.uri}}
