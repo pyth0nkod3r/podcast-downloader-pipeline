@@ -98,7 +98,7 @@ tasks:
       print(f"Extracted {len(result)} episodes")
 
   # Postgres
-  - id: store_podcasts
+  - id: create_table
     type: io.kestra.plugin.jdbc.postgresql.Queries
     sql: |
       CREATE TABLE IF NOT EXISTS podcast_history (
@@ -113,6 +113,9 @@ tasks:
       created_at TIMESTAMP DEFAULT NOW()
       )
 
+  - id: store_podcast
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
       INSERT INTO podcast_history (
       guid,
       title,
@@ -132,7 +135,12 @@ tasks:
       :creator,
       :pubDate,
       )
-
       ON CONFLICT (guid) DO NOTHING
-
       from: {{outputs.extract_podcasts.uri}}
+
+pluginDefaults:
+  - type: io.kestra.plugin.jdbc.postgresql
+    values:
+      url: jdbc:postgresql://pgdatabase:5432/
+      username: "{{secret('POSTGRES_USERNAME')}}"
+      password: "{{secret('('POSTGRES_PASSWORD')}}"
