@@ -16,12 +16,20 @@ variables:
     simplecast_demo: https://feeds.simplecast.com/54nAGcIl
 
 tasks:
+
+  - id: set_label
+    type: io.kestra.plugin.core.execution.Labels
+    labels:
+      rssUrl: "{{inputs.rss_url}}"
+
+  #-----EXTRACTION......
   # Fetch rss
   - id: rss_fetch
     type: io.kestra.plugin.core.http.Download
     uri: "{{vars.rss_mapping[inputs.rss_url]}}"
     method: GET
 
+  #------NORMALIZATION-------
   # xml to ion
   - id: xml_to_ion
     type: io.kestra.plugin.serdes.xml.XmlToIon
@@ -38,25 +46,18 @@ tasks:
     inputFiles:
       json_data.json: "{{outputs.ion_to_json.uri}}"
     outputFiles:
-      - podcast_data.json
-      - podcast_history.json
+      - podcast_data.csv
     script: |
       import json
-      import os
+      import csv
+
+      #---Load JSON--------
 
       with open("json_data.json", "r", encoding="utf-8") as f:
         raw_json = json.load(f)
       items = raw_json["rss"]["channel"]["item"]
 
-      history_file = "podcast_history.json"
-      if os.path.exists(history_file) and os.path.getsize(history_file) > 0:
-        print("History file with content exists")
-        with open(history_file, "r") as f:
-          old_guids = set(json.load(f))
-      else:
-        print("No history file exists")
-        old_guids = set()
-
+      #----Transform data----------
       result = [
         {
           "title": item.get("title"),
@@ -69,41 +70,32 @@ tasks:
         }
         for item in items
       ]
-
-      new_episode = []
-      for ep in result:
-        if ep['guid'] and ep["guid"] not in old_guids:
-          new_episode.append(ep)
-
-      for ep in new_episode:
-        ep = ep["guid"]
-      old_guids.update(ep)
-
-      with open(history_file, "w") as file:
-        json.dump(list(old_guids), file, indent=2)
-
-      # print(items[0])
-      # print("Old GUIDs:", old_guids)
-      # print("Total episodes:", len(result))
-      # print("New episodes:", len(new_episode))
-      # print("New Episodes:", new_episode)
-
-
-      # print(json.dumps(result, indent=2))
-
-      with open("podcast_data.json", "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
-
-      # print("podcast_data.json created successfully")
       print(f"Extracted {len(result)} episodes")
+
+      #----Write CSV------
+      with open('podcast_data.csv', 'w', newline='', encoding="utf-8") as file:
+        writer = csv.DictWriter(
+        file,
+        fieldnames=[
+          "guid",
+          "title",
+          "link",
+          "description",
+          "duration",
+          "creator",
+          "pubDate"
+          ]
+        )
+
+        writer.writeheader()
+        writer.writerows(result)
 
   # Postgres
   - id: create_table
     type: io.kestra.plugin.jdbc.postgresql.Queries
     sql: |
-      CREATE TABLE IF NOT EXISTS podcast_history (
-      id SERIAL PRIMARY KEY,
-      guid TEXT UNIQUE,
+      CREATE TABLE IF NOT EXISTS podcast_metadata (
+      guid TEXT PRIMARY KEY,
       title TEXT,
       link TEXT,
       description TEXT,
@@ -113,34 +105,66 @@ tasks:
       created_at TIMESTAMP DEFAULT NOW()
       )
 
-  - id: store_podcast
+  - id: create_staging_table
     type: io.kestra.plugin.jdbc.postgresql.Queries
     sql: |
-      INSERT INTO podcast_history (
+      DROP TABLE IF EXISTS podcast_staging;
+      CREATE TABLE podcast_staging (
+      guid TEXT,
+      title TEXT,
+      link TEXT,
+      description TEXT,
+      duration TEXT,
+      creator TEXT,
+      pubDate TEXT
+      )
+
+  - id: load_staging_table
+    type: io.kestra.plugin.jdbc.postgresql.CopyIn
+    format: CSV
+    from: "{{render(outputs.extract_podcasts.outputFiles['podcast_data.csv'])}}"
+    table: podcast_staging
+    columns:
+      - guid
+      - title
+      - link
+      - description
+      - duration
+      - creator
+      - pubDate
+
+  - id: store_podcast_metadata
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
+      MERGE INTO podcast_metadata as PM
+      USING podcast_staging as PS
+      ON PM.guid = PS.guid
+      WHEN NOT MATCHED THEN
+      INSERT (
       guid,
       title,
       link,
       description,
       duration,
       creator,
-      pubDate,
+      pubDate
       )
-
       VALUES (
-      :guid,
-      :title,
-      :link,
-      :description,
-      :duration,
-      :creator,
-      :pubDate,
+      PS.guid,
+      PS.title,
+      PS.link,
+      PS.description,
+      PS.duration,
+      PS.creator,
+      PS.pubDate
       )
-      ON CONFLICT (guid) DO NOTHING
-      from: {{outputs.extract_podcasts.uri}}
 
+  - id: purge_files
+    type: io.kestra.plugin.core.storage.PurgeCurrentExecutionFiles
+    description: To avoid cluttering your storage, we will remove the downloaded files
 pluginDefaults:
   - type: io.kestra.plugin.jdbc.postgresql
     values:
-      url: jdbc:postgresql://pgdatabase:5432/
-      username: "{{secret('POSTGRES_USERNAME')}}"
-      password: "{{secret('('POSTGRES_PASSWORD')}}"
+      url: jdbc:postgresql://pgdatabase:5432/podcast_db
+      username: "{{ secret('POSTGRES_USERNAME') }}"
+      password: "{{ secret('POSTGRES_PASSWORD') }}"
