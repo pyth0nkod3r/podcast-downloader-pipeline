@@ -118,7 +118,7 @@ tasks:
         }
         for item in items
       ]
-      print(f'result:{result}')
+      # print(f'result:{result}')
       print(f"Extracted {len(result)} episodes")
 
       #----Write CSV------
