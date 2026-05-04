@@ -213,7 +213,7 @@ tasks:
     then:
       - id: fail_pipeline
         type: io.kestra.plugin.core.execution.Fail
-        message: "RSS feed returned no items"
+        errorMessage: "RSS feed returned no items"
 
 pluginDefaults:
   - type: io.kestra.plugin.jdbc.postgresql
@@ -229,13 +229,13 @@ triggers:
     inputs:
       rss_url: tech_news
 
-  - id: podcast_schedule
+  - id: commit_your_code_schedule
     type: io.kestra.plugin.core.trigger.Schedule
     cron: "0 * * * *"
     inputs:
       rss_url: commit_your_code
 
-  - id: podcast_schedule
+  - id: simplecast_schedule
     type: io.kestra.plugin.core.trigger.Schedule
     cron: "0 * * * *"
     inputs:
