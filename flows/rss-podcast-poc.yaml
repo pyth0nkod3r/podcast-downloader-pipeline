@@ -1,6 +1,9 @@
 id: rss-podcast-poc
 namespace: deeptech
 
+concurrency:
+  limit: 1
+
 inputs:
   - id: rss_url
     type: SELECT
@@ -21,6 +24,8 @@ tasks:
     type: io.kestra.plugin.core.execution.Labels
     labels:
       rssUrl: "{{inputs.rss_url}}"
+      execution_type: "{{trigger.date is not null ? 'scheduled' : 'manual'}}"
+      backfill: "{{trigger.date is not null and trigger.date < now()}}"
 
   #-----EXTRACTION......
   # Fetch rss
@@ -51,6 +56,21 @@ tasks:
       import json
       import csv
 
+
+      #---helpers---
+      def extract_guid(guid_field):
+        if isinstance(guid_field, dict):
+          return guid_field.get("content")
+        return guid_field
+
+      def extract_creator(item):
+        return (
+        item.get("dc:creator")
+        or item.get("author")
+        or item.get("itunes:author")
+        )
+
+
       #---Load JSON--------
 
       with open("json_data.json", "r", encoding="utf-8") as f:
@@ -58,21 +78,26 @@ tasks:
       items = raw_json["rss"]["channel"]["item"]
 
       #----Transform data----------
+      source = "{{inputs.rss_url}}"
+
       result = [
         {
           "title": item.get("title"),
           "link": item.get("link"),
           "description": item.get("description"),
           "duration": item.get("itunes:duration"),
-          "creator": item.get("dc:creator"),
+          "creator": extract_creator(item),
           "pubDate": item.get("pubDate"),
-          "guid": item.get("guid", {}).get("content")
+          "guid": extract_guid(item.get("guid")),
+          "source": source
         }
         for item in items
       ]
+      print(f'result:{result}')
       print(f"Extracted {len(result)} episodes")
 
       #----Write CSV------
+
       with open('podcast_data.csv', 'w', newline='', encoding="utf-8") as file:
         writer = csv.DictWriter(
         file,
@@ -83,12 +108,26 @@ tasks:
           "description",
           "duration",
           "creator",
-          "pubDate"
-          ]
+          "pubDate",
+          "source"
+          ],
+          quoting=csv.QUOTE_MINIMAL
         )
 
+        cleaned = [r for r in result if r["guid"] and r["title"]]
+        print(f"Valid records: {len(cleaned)} / {len(result)}")
+
         writer.writeheader()
-        writer.writerows(result)
+        writer.writerows(cleaned)
+
+        invalid = [r for r in result if not (r["guid"] and r["title"])]
+        print(f"Invalid records dropped: {len(invalid)}")
+
+      print("=== PIPELINE SUMMARY ===")
+      print(f"Feed: {source}")
+      print(f"Total extracted: {len(result)}")
+      print(f"Valid records: {len(cleaned)}")
+      print(f"Execution time: {{ now() }}")
 
   # Postgres
   - id: create_table
@@ -103,6 +142,7 @@ tasks:
       creator TEXT,
       pubDate TEXT,
       created_at TIMESTAMP DEFAULT NOW()
+      source TEXT,
       )
 
   - id: create_staging_table
@@ -116,7 +156,8 @@ tasks:
       description TEXT,
       duration TEXT,
       creator TEXT,
-      pubDate TEXT
+      pubDate TEXT,
+      source TEXT
       )
 
   - id: load_staging_table
@@ -132,6 +173,7 @@ tasks:
       - duration
       - creator
       - pubDate
+      - source
 
   - id: store_podcast_metadata
     type: io.kestra.plugin.jdbc.postgresql.Queries
@@ -147,7 +189,8 @@ tasks:
       description,
       duration,
       creator,
-      pubDate
+      pubDate,
+      source
       )
       VALUES (
       PS.guid,
@@ -156,15 +199,44 @@ tasks:
       PS.description,
       PS.duration,
       PS.creator,
-      PS.pubDate
+      PS.pubDate,
+      PS.source
       )
 
   - id: purge_files
     type: io.kestra.plugin.core.storage.PurgeCurrentExecutionFiles
     description: To avoid cluttering your storage, we will remove the downloaded files
+
+  - id: fail_if_empty_feed
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{outputs.staging_metrics.rows[0].total_rows == 0}}"
+    then:
+      - id: fail_pipeline
+        type: io.kestra.plugin.core.execution.Fail
+        message: "RSS feed returned no items"
+
 pluginDefaults:
   - type: io.kestra.plugin.jdbc.postgresql
     values:
       url: jdbc:postgresql://pgdatabase:5432/podcast_db
       username: "{{ secret('POSTGRES_USERNAME') }}"
       password: "{{ secret('POSTGRES_PASSWORD') }}"
+
+triggers:
+  - id: tech_news_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 * * * *"
+    inputs:
+      rss_url: tech_news
+
+  - id: podcast_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 * * * *"
+    inputs:
+      rss_url: commit_your_code
+
+  - id: podcast_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 * * * *"
+    inputs:
+      rss_url: simplecast_demo
