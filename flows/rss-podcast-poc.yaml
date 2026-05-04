@@ -3,6 +3,7 @@ namespace: deeptech
 
 concurrency:
   limit: 1
+  behavior: QUEUE
 
 inputs:
   - id: rss_url
@@ -12,6 +13,13 @@ inputs:
     values: [ "commit_your_code", "tech_news", "simplecast_demo" ]
     defaults: "commit_your_code"
 
+  - id: execution_mode
+    type: SELECT
+    defaults: manual
+    values:
+      - manual
+      - scheduled
+
 variables:
   rss_mapping:
     commit_your_code: https://anchor.fm/s/1cd48480/podcast/rss
@@ -20,12 +28,29 @@ variables:
 
 tasks:
 
+  - id: is_scheduled
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{trigger is defined and trigger.date is defined}}"
+    then:
+      - id: label_scheduled
+        type: io.kestra.plugin.core.execution.Labels
+        labels:
+          execution_type: scheduled
+          is_backfill: "true"
+          trigger_date: "{{ trigger.date ?? execution.startDate ?? now() }}"
+    else:
+      - id: label_manual
+        type: io.kestra.plugin.core.execution.Labels
+        labels:
+          execution_type: manual
+          is_backfill: "false"
+          trigger_date: none
+
   - id: set_label
     type: io.kestra.plugin.core.execution.Labels
     labels:
       rssUrl: "{{inputs.rss_url}}"
-      execution_type: "{{trigger.date is not null ? 'scheduled' : 'manual'}}"
-      backfill: "{{trigger.date is not null and trigger.date < now()}}"
+      execution_mode: "{{inputs.execution_mode}}"
 
   #-----EXTRACTION......
   # Fetch rss
@@ -141,8 +166,8 @@ tasks:
       duration TEXT,
       creator TEXT,
       pubDate TEXT,
-      created_at TIMESTAMP DEFAULT NOW()
-      source TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      source TEXT
       )
 
   - id: create_staging_table
@@ -207,13 +232,6 @@ tasks:
     type: io.kestra.plugin.core.storage.PurgeCurrentExecutionFiles
     description: To avoid cluttering your storage, we will remove the downloaded files
 
-  - id: fail_if_empty_feed
-    type: io.kestra.plugin.core.flow.If
-    condition: "{{outputs.staging_metrics.rows[0].total_rows == 0}}"
-    then:
-      - id: fail_pipeline
-        type: io.kestra.plugin.core.execution.Fail
-        errorMessage: "RSS feed returned no items"
 
 pluginDefaults:
   - type: io.kestra.plugin.jdbc.postgresql
@@ -228,15 +246,18 @@ triggers:
     cron: "0 * * * *"
     inputs:
       rss_url: tech_news
+      execution_mode: scheduled
 
   - id: commit_your_code_schedule
     type: io.kestra.plugin.core.trigger.Schedule
     cron: "0 * * * *"
     inputs:
       rss_url: commit_your_code
+      execution_mode: scheduled
 
   - id: simplecast_schedule
     type: io.kestra.plugin.core.trigger.Schedule
     cron: "0 * * * *"
     inputs:
       rss_url: simplecast_demo
+      execution_mode: scheduled
