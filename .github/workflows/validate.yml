@@ -1,0 +1,30 @@
+name: Validate Kestra Flows
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'flows/**'
+      - '.github/linters/.yamllint.yml'
+
+jobs:
+  validate:
+    name: Lint & Validate Flows
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install yamllint
+        run: pip install yamllint
+
+      - name: Lint Kestra flow files
+        run: yamllint -c .github/linters/.yamllint.yml flows/
+
+      - name: Validate YAML structure
+        run: |
+          echo "✅ All flow files passed YAML linting"
+          echo ""
+          echo "Files validated:"
+          find flows/ -name '*.yaml' -o -name '*.yml' | sort

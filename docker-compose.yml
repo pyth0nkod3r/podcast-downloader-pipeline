@@ -9,6 +9,8 @@ volumes:
     driver: local
   kestra_tmp:
     driver: local
+  metabase_data:
+    driver: local
 
 services:
   pgdatabase:
@@ -96,4 +98,16 @@ services:
       - "8081:8081"
     depends_on:
       kestra_postgres:
+        condition: service_started
+
+  metabase:
+    image: metabase/metabase::v0.61.0.2-beta
+    environment:
+      MB_DB_TYPE: h2
+    volumes:
+      - metabase_data:/metabase-data
+    ports:
+      - "3000:3000"
+    depends_on:
+      pgdatabase:
         condition: service_started
