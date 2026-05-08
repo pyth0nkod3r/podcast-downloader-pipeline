@@ -95,6 +95,12 @@ tasks:
         or item.get("itunes:author")
         )
 
+      def extract_audio_url(item):
+        enclosure = item.get("enclosure")
+        if isinstance(enclosure, dict):
+          return enclosure.get("@url") or enclosure.get("url")
+        return None
+
 
       #---Load JSON--------
 
@@ -114,6 +120,7 @@ tasks:
           "creator": extract_creator(item),
           "pubDate": item.get("pubDate"),
           "guid": extract_guid(item.get("guid")),
+          "audio_url": extract_audio_url(item),
           "source": source
         }
         for item in items
@@ -134,6 +141,7 @@ tasks:
           "duration",
           "creator",
           "pubDate",
+          "audio_url",
           "source"
           ],
           quoting=csv.QUOTE_MINIMAL
@@ -154,6 +162,16 @@ tasks:
       print(f"Valid records: {len(cleaned)}")
       print(f"Execution time: {{ now() }}")
 
+      #----Write audio URL list for download loop------
+      import json as _json
+      audio_items = [
+        {"guid": r["guid"], "audio_url": r["audio_url"], "title": r["title"]}
+        for r in cleaned if r.get("audio_url")
+      ]
+      with open("audio_urls.json", "w", encoding="utf-8") as af:
+        _json.dump(audio_items, af)
+      print(f"Audio URLs to download: {len(audio_items)}")
+
   # Postgres
   - id: create_table
     type: io.kestra.plugin.jdbc.postgresql.Queries
@@ -166,6 +184,7 @@ tasks:
       duration TEXT,
       creator TEXT,
       pubDate TEXT,
+      audio_url TEXT,
       created_at TIMESTAMP DEFAULT NOW(),
       source TEXT
       )
@@ -182,6 +201,7 @@ tasks:
       duration TEXT,
       creator TEXT,
       pubDate TEXT,
+      audio_url TEXT,
       source TEXT
       )
 
@@ -198,6 +218,7 @@ tasks:
       - duration
       - creator
       - pubDate
+      - audio_url
       - source
 
   - id: store_podcast_metadata
@@ -215,6 +236,7 @@ tasks:
       duration,
       creator,
       pubDate,
+      audio_url,
       source
       )
       VALUES (
@@ -225,12 +247,128 @@ tasks:
       PS.duration,
       PS.creator,
       PS.pubDate,
+      PS.audio_url,
       PS.source
       )
 
+  #------AUDIO DOWNLOAD-------
+  # Downloads each audio file to the persistent /app/storage/audio volume.
+  # Files are named by sanitized episode title so they are human-readable.
+  - id: download_audio
+    type: io.kestra.plugin.scripts.python.Script
+    inputFiles:
+      audio_urls.json: "{{render(outputs.extract_podcasts.outputFiles['audio_urls.json'])}}"
+    outputFiles:
+      - download_results.csv
+    script: |
+      import json
+      import os
+      import re
+      import requests
+
+      AUDIO_DIR = "/app/storage/audio"
+      os.makedirs(AUDIO_DIR, exist_ok=True)
+
+      def sanitize_title(title):
+        """Convert episode title to a safe filename."""
+        safe = re.sub(r'[^\w\s-]', '', title or 'unknown')
+        safe = re.sub(r'[\s_]+', '_', safe).strip('_')
+        return safe[:100]  # cap filename length
+
+      with open("audio_urls.json", "r", encoding="utf-8") as f:
+        items = json.load(f)
+
+      results = []
+      for item in items:
+        guid = item["guid"]
+        url = item["audio_url"]
+        title = item.get("title", guid)
+        filename = sanitize_title(title) + ".mp3"
+        filepath = os.path.join(AUDIO_DIR, filename)
+
+        # Skip if already downloaded
+        if os.path.exists(filepath):
+          print(f"[SKIP] Already exists: {filename}")
+          results.append({"guid": guid, "file_path": filepath, "status": "skipped"})
+          continue
+
+        try:
+          response = requests.get(url, stream=True, timeout=60)
+          response.raise_for_status()
+          with open(filepath, "wb") as audio_file:
+            for chunk in response.iter_content(chunk_size=8192):
+              audio_file.write(chunk)
+          print(f"[OK] Downloaded: {filename}")
+          results.append({"guid": guid, "file_path": filepath, "status": "success"})
+        except Exception as e:
+          print(f"[FAIL] {filename}: {e}")
+          results.append({"guid": guid, "file_path": "", "status": f"error: {e}"})
+
+      with open("download_results.csv", "w", newline="", encoding="utf-8") as rf:
+        import csv
+        writer = csv.DictWriter(rf, fieldnames=["guid", "file_path", "status"])
+        writer.writeheader()
+        writer.writerows([{"guid": r["guid"], "file_path": r["file_path"], "status": r["status"]} for r in results])
+
+      ok = sum(1 for r in results if r["status"] == "success")
+      skip = sum(1 for r in results if r["status"] == "skipped")
+      fail = sum(1 for r in results if r["status"].startswith("error"))
+      print(f"=== AUDIO DOWNLOAD SUMMARY ===")
+      print(f"Downloaded: {ok} | Skipped (exists): {skip} | Failed: {fail}")
+
+  #------DOWNLOAD TRACKING-------
+  - id: create_downloads_table
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
+      CREATE TABLE IF NOT EXISTS podcast_downloads (
+        guid       TEXT PRIMARY KEY,
+        file_path  TEXT,
+        status     TEXT,
+        downloaded_at TIMESTAMP DEFAULT NOW()
+      )
+
+  - id: create_downloads_staging
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
+      DROP TABLE IF EXISTS podcast_downloads_staging;
+      CREATE TABLE podcast_downloads_staging (
+        guid      TEXT,
+        file_path TEXT,
+        status    TEXT
+      )
+
+  - id: load_downloads_staging
+    type: io.kestra.plugin.jdbc.postgresql.CopyIn
+    format: CSV
+    from: "{{render(outputs.download_audio.outputFiles['download_results.csv'])}}"
+    table: podcast_downloads_staging
+    columns:
+      - guid
+      - file_path
+      - status
+
+  - id: merge_downloads
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
+      MERGE INTO podcast_downloads AS PD
+      USING podcast_downloads_staging AS PDS
+      ON PD.guid = PDS.guid
+      WHEN MATCHED THEN
+        UPDATE SET
+          file_path    = PDS.file_path,
+          status       = PDS.status,
+          downloaded_at = NOW()
+      WHEN NOT MATCHED THEN
+        INSERT (guid, file_path, status, downloaded_at)
+        VALUES (PDS.guid, PDS.file_path, PDS.status, NOW())
+
   - id: purge_files
     type: io.kestra.plugin.core.storage.PurgeCurrentExecutionFiles
-    description: To avoid cluttering your storage, we will remove the downloaded files
+    description: Remove intermediate CSV/JSON files; audio files are already persisted to the podcast_audio volume.
+    include:
+      - "podcast_data.csv"
+      - "audio_urls.json"
+      - "download_results.csv"
 
 
 pluginDefaults:

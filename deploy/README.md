@@ -1,6 +1,6 @@
 # Deployment Guide — Podcast Downloader Pipeline
 
-This guide walks you through deploying the full pipeline stack on an Azure Debian VM using Coolify.
+This guide walks you through deploying the full pipeline stack on an Azure Debian VM using Coolify v4.
 
 ## Architecture
 
@@ -12,6 +12,7 @@ Azure Debian VM (B2s: 2 vCPU, 4 GB RAM)
 │   ├── App Postgres (podcast data) → :5432
 │   ├── pgAdmin (DB admin UI) → :8085
 │   └── Metabase (dashboard) → :3000
+│       └── podcast_audio volume (MP3 files, persisted)
 └── Traefik (reverse proxy + auto-SSL)
 ```
 
@@ -64,22 +65,46 @@ Create your admin account on first visit.
 
 ---
 
-## Step 3: Connect GitHub Repository
+## Step 3: Register the VPS as a Server in Coolify
 
-1. In Coolify dashboard: **Projects** → **New Project** → give it a name (e.g., "Podcast Pipeline")
-2. **Add Resource** → **Docker Compose** → **GitHub Repository**
-3. Connect your GitHub account (Coolify will guide you through OAuth)
-4. Select repo: `pyth0nkod3r/podcast-downloader-pipeline`
-5. Set **branch:** `main`
-6. Coolify will auto-detect the `docker-compose.yml`
+> This step is required before you can deploy any resources. Coolify must know about the server it is running on.
+
+1. In the Coolify dashboard, click **Servers** in the left sidebar.
+2. Click **Add Server**.
+3. Select **Localhost** (since Coolify is running on the same VM as your stack).
+4. Click **Save** — Coolify will validate the connection via the Docker socket automatically.
+5. You will see your server appear as **Reachable** with a green indicator.
 
 ---
 
-## Step 4: Configure Environment Variables
+## Step 4: Create a Project and Environment
 
-In Coolify, go to your project → **Environment Variables** and add:
+1. In the Coolify dashboard, click **Projects** in the left sidebar.
+2. Click **+ Create New Project**.
+3. Name it **Podcast Pipeline** → click **Create**.
+4. Inside the project, click **+ New Environment**.
+5. Name it **production** → click **Create**.
 
-### From `.env` (app database)
+---
+
+## Step 5: Add a Docker Compose Resource
+
+1. Inside the **production** environment, click **+ Add New Resource**.
+2. Choose **Docker Compose** as the resource type.
+3. Choose **GitHub** as the source.
+4. Click **Connect GitHub** and authorize Coolify to read your repositories (OAuth flow).
+5. Select the repo: `pyth0nkod3r/podcast-downloader-pipeline`
+6. Set **Branch:** `main`
+7. Coolify auto-detects `docker-compose.yml` in the repo root — confirm the path is correct.
+8. Click **Continue**.
+
+---
+
+## Step 6: Configure Environment Variables
+
+In Coolify, go to your resource → **Environment Variables** tab and add the following:
+
+### App Database
 ```
 DB_USER=<your_postgres_user>
 DB_PASSWORD=<your_postgres_password>
@@ -88,30 +113,100 @@ PGADMIN_USER=<your_pgadmin_email>
 PGADMIN_PASSWORD=<your_pgadmin_password>
 ```
 
-### From `.env_encoded` (Kestra secrets)
+### Kestra Secrets (base64-encoded)
 ```
-SECRET_POSTGRES_USERNAME=<base64_encoded_value>
-SECRET_POSTGRES_PASSWORD=<base64_encoded_value>
+SECRET_POSTGRES_USERNAME=<base64_encoded_db_user>
+SECRET_POSTGRES_PASSWORD=<base64_encoded_db_password>
+```
+> **Tip:** Generate encoded values with: `echo -n "your_value" | base64`
+
+### Metabase Admin
+```
+MB_ADMIN_EMAIL=<your_metabase_admin_email>
+MB_ADMIN_PASSWORD=<your_metabase_admin_password>
+MB_URL=http://localhost:3000
+MB_DB_NAME=podcast_db
 ```
 
-> **Tip:** Generate encoded values with: `echo -n "your_password" | base64`
+> **Note:** Mark all passwords as **Secret** using the lock icon in Coolify's UI — this prevents them from appearing in deployment logs.
 
 ---
 
-## Step 5: Deploy
+## Step 7: Deploy
 
-Click **Deploy** in Coolify. It will:
-1. Pull the repository
-2. Read `docker-compose.yml`
-3. Pull all container images
-4. Start all services
-5. Set up networking between containers
+1. Click **Deploy** in Coolify.
+2. Coolify will:
+   - Clone the repository
+   - Pull all container images
+   - Create all named volumes (including `podcast_audio` for persisted MP3 files)
+   - Start all 5 services
+   - Set up internal networking between containers
 
 Monitor the deployment logs in the Coolify dashboard.
 
+**Expected running services:**
+| Service | Port | Purpose |
+|---|---|---|
+| `kestra` | :8089 | Workflow orchestration |
+| `pgdatabase` | :5432 | Podcast metadata + downloads DB |
+| `kestra_postgres` | internal | Kestra's internal state DB |
+| `pgadmin` | :8085 | Database admin UI |
+| `metabase` | :3000 | Analytics dashboard |
+
 ---
 
-## Step 6: Configure Domains & SSL (Optional)
+## Step 8: Connect Metabase to PostgreSQL
+
+> This one-time setup is done via the Metabase UI wizard on first boot.
+
+1. Open `http://<vm-ip>:3000`
+2. Complete the Metabase welcome wizard (language, admin account creation)
+3. When asked **"Add your data"**, choose **PostgreSQL** and enter:
+   | Field | Value |
+   |---|---|
+   | Host | `pgdatabase` |
+   | Port | `5432` |
+   | Database name | `podcast_db` |
+   | Username | your `DB_USER` |
+   | Password | your `DB_PASSWORD` |
+4. Click **Connect database** → Metabase will sync the schema automatically.
+
+---
+
+## Step 9: Provision the Dashboard via Script
+
+After Metabase is connected to PostgreSQL and the Kestra flow has run at least once (so that `podcast_metadata` and `podcast_downloads` tables exist), run the provisioning script:
+
+```bash
+# SSH into your VM
+ssh your-user@<your-vm-ip>
+
+# Set credentials (or export from your .env)
+export MB_ADMIN_EMAIL="your_metabase_email"
+export MB_ADMIN_PASSWORD="your_metabase_password"
+export MB_URL="http://localhost:3000"
+export MB_DB_NAME="podcast_db"
+
+# Run the script
+bash /path/to/podcast-downloader-pipeline/deploy/metabase_setup.sh
+```
+
+The script will create a **"Podcast Pipeline Monitor"** dashboard with 4 panels:
+- 📊 **Episodes by Source** (bar chart)
+- 📅 **Episodes Added Over Time** (line chart)
+- ✅ **Download Status Breakdown** (pie chart)
+- 🕐 **Recent Downloads** (table)
+
+Open the dashboard at the URL printed by the script.
+
+> **Tip:** You can add this script as a **Post-Deploy Command** in Coolify (Resource → Settings → Post-Deploy Command) so it runs automatically after each deployment:
+> ```
+> bash deploy/metabase_setup.sh
+> ```
+
+---
+
+## Step 10: Configure Domains & SSL (Optional)
 
 If you have a domain name:
 
@@ -123,9 +218,9 @@ If you have a domain name:
 
 ---
 
-## Step 7: Set Up Coolify Webhook for CI/CD
+## Step 11: Set Up Coolify Webhook for CI/CD
 
-1. In Coolify: **Project** → **Settings** → **Webhooks**
+1. In Coolify: **Project** → your resource → **Settings** → **Deploy Webhook**
 2. Copy the **Deploy Webhook URL**
 3. In GitHub: **Settings** → **Secrets and variables** → **Actions** → Add secret:
    - Name: `COOLIFY_WEBHOOK_URL`
@@ -133,7 +228,7 @@ If you have a domain name:
 
 ---
 
-## Step 8: Configure GitHub Secrets
+## Step 12: Configure GitHub Secrets
 
 Add these secrets in **GitHub → Settings → Secrets and variables → Actions**:
 
@@ -142,7 +237,7 @@ Add these secrets in **GitHub → Settings → Secrets and variables → Actions
 | `KESTRA_URL` | `http://<vm-ip>:8089` (or `https://kestra.yourdomain.com`) |
 | `KESTRA_USER` | `admin@kestra.io` |
 | `KESTRA_PASSWORD` | Your Kestra password |
-| `COOLIFY_WEBHOOK_URL` | From Step 7 |
+| `COOLIFY_WEBHOOK_URL` | From Step 11 |
 | `SMTP_SERVER` | e.g., `smtp.gmail.com` |
 | `SMTP_PORT` | e.g., `587` |
 | `SMTP_USERNAME` | Your email address |
@@ -151,33 +246,21 @@ Add these secrets in **GitHub → Settings → Secrets and variables → Actions
 
 ---
 
-## Step 9: Set Up Metabase
-
-1. Open `http://<vm-ip>:3000` (or `https://dashboard.yourdomain.com`)
-2. Complete the Metabase setup wizard
-3. When asked for database connection:
-   - **Type:** PostgreSQL
-   - **Host:** `pgdatabase`
-   - **Port:** `5432`
-   - **Database:** `podcast_db` (your `DB_NAME`)
-   - **Username:** your `DB_USER`
-   - **Password:** your `DB_PASSWORD`
-4. Metabase auto-discovers `podcast_metadata` table
-5. Build your dashboard panels (see main README)
-
----
-
 ## Verification Checklist
 
 - [ ] Coolify dashboard accessible at `:8000`
+- [ ] VPS server registered as **Localhost** in Coolify (green / Reachable)
+- [ ] All 5 services show as **Running** in Coolify project
 - [ ] Kestra UI accessible at `:8089`
 - [ ] Metabase accessible at `:3000`
 - [ ] pgAdmin accessible at `:8085`
-- [ ] Kestra flows are running on schedule
+- [ ] Metabase connected to `pgdatabase:5432/podcast_db`
+- [ ] Kestra flow runs manually without errors
+- [ ] Audio `.mp3` files appear in the `podcast_audio` Docker volume
+- [ ] `podcast_downloads` table populated in PostgreSQL
+- [ ] `metabase_setup.sh` runs successfully → dashboard visible
 - [ ] Push to `main` triggers CI/CD pipeline
 - [ ] Flow changes deploy without container restart
-- [ ] Infrastructure changes trigger Coolify redeploy
-- [ ] Email notification arrives on failure
 
 ---
 
@@ -201,3 +284,13 @@ If Kestra or Metabase are OOM-killed, consider upgrading to B2ms (8 GB RAM).
 ### Kestra API unreachable from GitHub Actions
 - Ensure port 8089 is open in Azure NSG
 - Check Kestra is running: `curl http://localhost:8089/api/v1/flows`
+
+### Audio files not appearing
+```bash
+# Check the podcast_audio volume contents from inside the Kestra container
+docker exec -it <kestra-container-name> ls /app/storage/audio
+```
+
+### Metabase setup script fails — database not found
+- Make sure you connected PostgreSQL in the Metabase UI (Step 8) **before** running the script.
+- The script looks for a database named `podcast_db`. Verify the name matches your `DB_NAME`.

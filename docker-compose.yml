@@ -11,6 +11,8 @@ volumes:
     driver: local
   metabase_data:
     driver: local
+  podcast_audio:
+    driver: local
 
 services:
   pgdatabase:
@@ -66,6 +68,7 @@ services:
     command: server standalone
     volumes:
       - kestra_data:/app/storage
+      - podcast_audio:/app/storage/audio
       - /var/run/docker.sock:/var/run/docker.sock
       - kestra_tmp:/tmp/kestra-wd
     environment:
@@ -101,9 +104,11 @@ services:
         condition: service_started
 
   metabase:
-    image: metabase/metabase::v0.61.0.2-beta
+    image: metabase/metabase:v0.61.0.2-beta
     environment:
       MB_DB_TYPE: h2
+      MB_ADMIN_EMAIL: ${MB_ADMIN_EMAIL}
+      MB_ADMIN_PASSWORD: ${MB_ADMIN_PASSWORD}
     volumes:
       - metabase_data:/metabase-data
     ports:

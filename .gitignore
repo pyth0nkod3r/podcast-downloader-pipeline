@@ -1,6 +1,6 @@
-//.specstory
-//.vscode
-//.env
-//.env.encoded
-//.env_encoded
-metabase_data/
+#.specstory
+.vscode
+.env
+.env.encoded
+.env_encoded
+//metabase_data/
