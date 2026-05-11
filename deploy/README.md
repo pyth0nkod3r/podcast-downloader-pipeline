@@ -11,7 +11,7 @@ Azure Debian VM (B2s: 2 vCPU, 4 GB RAM)
 │   ├── Kestra Postgres (internal DB) → internal
 │   ├── App Postgres (podcast data) → :5432
 │   ├── pgAdmin (DB admin UI) → :8085
-│   └── Metabase (dashboard) → :3000
+│   └── Streamlit (dashboard) → :8501
 │       └── podcast_audio volume (MP3 files, persisted)
 └── Traefik (reverse proxy + auto-SSL)
 ```
@@ -42,7 +42,7 @@ Azure Debian VM (B2s: 2 vCPU, 4 GB RAM)
    | 443 | HTTPS (Coolify/Traefik) |
    | 8000 | Coolify Dashboard |
    | 8089 | Kestra UI |
-   | 3000 | Metabase |
+   | 8501 | Streamlit |
 4. Note the **Public IP** of your VM
 
 ---
@@ -120,17 +120,7 @@ SECRET_POSTGRES_PASSWORD=<base64_encoded_db_password>
 ```
 > **Tip:** Generate encoded values with: `echo -n "your_value" | base64`
 
-### Metabase Admin
-```
-MB_ADMIN_EMAIL=<your_metabase_admin_email>
-MB_ADMIN_PASSWORD=<your_metabase_admin_password>
-MB_URL=http://localhost:3000
-MB_DB_NAME=podcast_db
-```
 
-> **Note:** Mark all passwords as **Secret** using the lock icon in Coolify's UI — this prevents them from appearing in deployment logs.
-
----
 
 ## Step 7: Deploy
 
@@ -151,58 +141,23 @@ Monitor the deployment logs in the Coolify dashboard.
 | `pgdatabase` | :5432 | Podcast metadata + downloads DB |
 | `kestra_postgres` | internal | Kestra's internal state DB |
 | `pgadmin` | :8085 | Database admin UI |
-| `metabase` | :3000 | Analytics dashboard |
+| `streamlit` | :8501 | Analytics dashboard |
 
 ---
 
-## Step 8: Connect Metabase to PostgreSQL
+## Step 8: View the Streamlit Dashboard
 
-> This one-time setup is done via the Metabase UI wizard on first boot.
+Since Streamlit is defined entirely in code, no manual database connection setup or API provisioning script is needed.
+Once the container is running:
 
-1. Open `http://<vm-ip>:3000`
-2. Complete the Metabase welcome wizard (language, admin account creation)
-3. When asked **"Add your data"**, choose **PostgreSQL** and enter:
-   | Field | Value |
-   |---|---|
-   | Host | `pgdatabase` |
-   | Port | `5432` |
-   | Database name | `podcast_db` |
-   | Username | your `DB_USER` |
-   | Password | your `DB_PASSWORD` |
-4. Click **Connect database** → Metabase will sync the schema automatically.
+1. Open `http://<vm-ip>:8501`
+2. You will immediately see the **"Podcast Pipeline Monitor"** dashboard with 4 panels:
+   - 📊 **Episodes by Source** (bar chart)
+   - 📅 **Episodes Added Over Time** (line chart)
+   - ✅ **Download Status Breakdown** (pie chart)
+   - 🕐 **Recent Downloads** (table)
 
----
-
-## Step 9: Provision the Dashboard via Script
-
-After Metabase is connected to PostgreSQL and the Kestra flow has run at least once (so that `podcast_metadata` and `podcast_downloads` tables exist), run the provisioning script:
-
-```bash
-# SSH into your VM
-ssh your-user@<your-vm-ip>
-
-# Set credentials (or export from your .env)
-export MB_ADMIN_EMAIL="your_metabase_email"
-export MB_ADMIN_PASSWORD="your_metabase_password"
-export MB_URL="http://localhost:3000"
-export MB_DB_NAME="podcast_db"
-
-# Run the script
-bash /path/to/podcast-downloader-pipeline/deploy/metabase_setup.sh
-```
-
-The script will create a **"Podcast Pipeline Monitor"** dashboard with 4 panels:
-- 📊 **Episodes by Source** (bar chart)
-- 📅 **Episodes Added Over Time** (line chart)
-- ✅ **Download Status Breakdown** (pie chart)
-- 🕐 **Recent Downloads** (table)
-
-Open the dashboard at the URL printed by the script.
-
-> **Tip:** You can add this script as a **Post-Deploy Command** in Coolify (Resource → Settings → Post-Deploy Command) so it runs automatically after each deployment:
-> ```
-> bash deploy/metabase_setup.sh
-> ```
+> **Note:** If the Kestra pipeline hasn't run yet, the dashboard will gracefully handle empty data states. Once Kestra downloads podcasts, the dashboard will update automatically on refresh.
 
 ---
 
@@ -252,13 +207,11 @@ Add these secrets in **GitHub → Settings → Secrets and variables → Actions
 - [ ] VPS server registered as **Localhost** in Coolify (green / Reachable)
 - [ ] All 5 services show as **Running** in Coolify project
 - [ ] Kestra UI accessible at `:8089`
-- [ ] Metabase accessible at `:3000`
+- [ ] Streamlit dashboard accessible at `:8501`
 - [ ] pgAdmin accessible at `:8085`
-- [ ] Metabase connected to `pgdatabase:5432/podcast_db`
 - [ ] Kestra flow runs manually without errors
 - [ ] Audio `.mp3` files appear in the `podcast_audio` Docker volume
 - [ ] `podcast_downloads` table populated in PostgreSQL
-- [ ] `metabase_setup.sh` runs successfully → dashboard visible
 - [ ] Push to `main` triggers CI/CD pipeline
 - [ ] Flow changes deploy without container restart
 
@@ -279,7 +232,7 @@ docker logs <container-name>
 free -h
 docker stats
 ```
-If Kestra or Metabase are OOM-killed, consider upgrading to B2ms (8 GB RAM).
+If Kestra or Streamlit are OOM-killed, consider upgrading to B2ms (8 GB RAM).
 
 ### Kestra API unreachable from GitHub Actions
 - Ensure port 8089 is open in Azure NSG
@@ -291,6 +244,4 @@ If Kestra or Metabase are OOM-killed, consider upgrading to B2ms (8 GB RAM).
 docker exec -it <kestra-container-name> ls /app/storage/audio
 ```
 
-### Metabase setup script fails — database not found
-- Make sure you connected PostgreSQL in the Metabase UI (Step 8) **before** running the script.
-- The script looks for a database named `podcast_db`. Verify the name matches your `DB_NAME`.
+

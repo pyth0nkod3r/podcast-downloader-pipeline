@@ -1,0 +1,207 @@
+id: init-schema
+namespace: deeptech
+description: |
+  Creates all database tables and views for the podcast pipeline.
+  Run this once manually before the first pipeline run.
+  Safe to re-run — all statements use IF NOT EXISTS / CREATE OR REPLACE.
+
+tasks:
+
+  # ===== Core Tables =====
+
+  - id: create_podcast_feeds
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Feed catalog — the source of truth for which RSS feeds to process.
+    sql: |
+      CREATE TABLE IF NOT EXISTS podcast_feeds (
+        feed_id         SERIAL PRIMARY KEY,
+        feed_name       TEXT NOT NULL,
+        rss_url         TEXT NOT NULL UNIQUE,
+        category        TEXT,
+        is_active       BOOLEAN DEFAULT TRUE,
+        added_at        TIMESTAMP DEFAULT NOW(),
+        last_fetched_at TIMESTAMP
+      );
+
+  - id: create_podcast_metadata
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: One row per episode. The main fact table.
+    sql: |
+      CREATE TABLE IF NOT EXISTS podcast_metadata (
+        guid                    TEXT PRIMARY KEY,
+        title                   TEXT,
+        link                    TEXT,
+        description             TEXT,
+        duration                TEXT,
+        creator                 TEXT,
+        pubDate                 TEXT,
+        audio_url               TEXT,
+        created_at              TIMESTAMP DEFAULT NOW(),
+        source                  TEXT,
+        duration_seconds        INTEGER,
+        pub_date                TIMESTAMP,
+        episode_number          INTEGER,
+        season_number           INTEGER,
+        category                TEXT,
+        keywords                TEXT,
+        description_word_count  INTEGER,
+        audio_file_size_bytes   BIGINT,
+        explicit                BOOLEAN,
+        image_url               TEXT
+      );
+
+  - id: alter_podcast_metadata
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Add new columns to existing tables (safe if columns already exist).
+    sql: |
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS duration_seconds        INTEGER;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS pub_date                TIMESTAMP;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS episode_number          INTEGER;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS season_number           INTEGER;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS category                TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS keywords                TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS description_word_count  INTEGER;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS audio_file_size_bytes   BIGINT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS explicit                BOOLEAN;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS image_url               TEXT;
+
+  - id: create_podcast_downloads
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Tracks audio file download status per episode.
+    sql: |
+      CREATE TABLE IF NOT EXISTS podcast_downloads (
+        guid          TEXT PRIMARY KEY,
+        file_path     TEXT,
+        status        TEXT,
+        downloaded_at TIMESTAMP DEFAULT NOW()
+      );
+
+  - id: create_pipeline_run_log
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Logs each pipeline execution for observability (Stage 5).
+    sql: |
+      CREATE TABLE IF NOT EXISTS pipeline_run_log (
+        run_id              TEXT PRIMARY KEY,
+        flow_id             TEXT,
+        started_at          TIMESTAMP,
+        finished_at         TIMESTAMP,
+        status              TEXT,
+        feeds_processed     INTEGER,
+        episodes_inserted   INTEGER,
+        episodes_skipped    INTEGER,
+        download_success    INTEGER,
+        download_failed     INTEGER,
+        error_message       TEXT
+      );
+
+  # ===== Analytical Views (Stage 3) =====
+
+  - id: create_view_episodes_clean
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Clean, typed version of raw metadata used as base for all other views.
+    sql: |
+      CREATE OR REPLACE VIEW v_episodes_clean AS
+      SELECT
+        guid,
+        title,
+        source,
+        category,
+        creator,
+        pub_date,
+        DATE_TRUNC('day',  pub_date)  AS pub_day,
+        DATE_TRUNC('week', pub_date)  AS pub_week,
+        DATE_TRUNC('month',pub_date)  AS pub_month,
+        EXTRACT(DOW  FROM pub_date)   AS day_of_week,
+        EXTRACT(HOUR FROM pub_date)   AS hour_of_day,
+        duration_seconds,
+        ROUND(duration_seconds / 60.0, 1) AS duration_minutes,
+        description_word_count,
+        explicit,
+        audio_url IS NOT NULL         AS has_audio,
+        audio_file_size_bytes,
+        keywords,
+        image_url,
+        created_at
+      FROM podcast_metadata
+      WHERE pub_date IS NOT NULL;
+
+  - id: create_view_feed_stats
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: One summary row per feed.
+    sql: |
+      CREATE OR REPLACE VIEW v_feed_stats AS
+      SELECT
+        source,
+        category,
+        COUNT(*)                              AS total_episodes,
+        ROUND(AVG(duration_seconds)/60.0, 1)  AS avg_duration_minutes,
+        MAX(pub_date)                         AS latest_episode_date,
+        MIN(pub_date)                         AS oldest_episode_date,
+        ROUND(AVG(description_word_count),0)  AS avg_description_words,
+        SUM(CASE WHEN explicit THEN 1 ELSE 0 END) AS explicit_episode_count,
+        SUM(CASE WHEN audio_url IS NOT NULL THEN 1 ELSE 0 END) AS episodes_with_audio,
+        NOW() - MAX(pub_date)                 AS days_since_last_episode
+      FROM v_episodes_clean
+      GROUP BY source, category;
+
+  - id: create_view_publishing_heatmap
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Counts by day-of-week and hour for the heatmap chart.
+    sql: |
+      CREATE OR REPLACE VIEW v_publishing_heatmap AS
+      SELECT
+        day_of_week,
+        hour_of_day,
+        COUNT(*) AS episode_count
+      FROM v_episodes_clean
+      GROUP BY day_of_week, hour_of_day;
+
+  - id: create_view_weekly_volume
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Episode counts per week for the trend chart.
+    sql: |
+      CREATE OR REPLACE VIEW v_weekly_volume AS
+      SELECT
+        pub_week,
+        category,
+        COUNT(*) AS episodes_published
+      FROM v_episodes_clean
+      GROUP BY pub_week, category
+      ORDER BY pub_week;
+
+  - id: create_view_download_health
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Pipeline health summary — downloads per day per status.
+    sql: |
+      CREATE OR REPLACE VIEW v_download_health AS
+      SELECT
+        DATE_TRUNC('day', downloaded_at) AS day,
+        status,
+        COUNT(*) AS count
+      FROM podcast_downloads
+      GROUP BY 1, 2
+      ORDER BY 1 DESC;
+
+  - id: create_view_data_quality
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: One row per feed showing metadata completeness percentages.
+    sql: |
+      CREATE OR REPLACE VIEW v_data_quality AS
+      SELECT
+        source,
+        COUNT(*)                                                                       AS total,
+        ROUND(100.0 * SUM(CASE WHEN title IS NOT NULL THEN 1 ELSE 0 END)           / COUNT(*), 1) AS pct_has_title,
+        ROUND(100.0 * SUM(CASE WHEN audio_url IS NOT NULL THEN 1 ELSE 0 END)       / COUNT(*), 1) AS pct_has_audio_url,
+        ROUND(100.0 * SUM(CASE WHEN duration_seconds IS NOT NULL THEN 1 ELSE 0 END)/ COUNT(*), 1) AS pct_has_duration,
+        ROUND(100.0 * SUM(CASE WHEN pub_date IS NOT NULL THEN 1 ELSE 0 END)        / COUNT(*), 1) AS pct_has_pub_date,
+        ROUND(100.0 * SUM(CASE WHEN category IS NOT NULL THEN 1 ELSE 0 END)        / COUNT(*), 1) AS pct_has_category
+      FROM podcast_metadata
+      GROUP BY source
+      ORDER BY total DESC;
+
+pluginDefaults:
+  - type: io.kestra.plugin.jdbc.postgresql
+    values:
+      url: jdbc:postgresql://pgdatabase:5432/podcast_db
+      username: "{{ secret('POSTGRES_USERNAME') }}"
+      password: "{{ secret('POSTGRES_PASSWORD') }}"

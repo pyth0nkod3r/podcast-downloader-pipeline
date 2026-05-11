@@ -9,8 +9,6 @@ volumes:
     driver: local
   kestra_tmp:
     driver: local
-  metabase_data:
-    driver: local
   podcast_audio:
     driver: local
 
@@ -25,9 +23,6 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql
-    depends_on:
-      kestra:
-        condition: service_started
 
   pgadmin:
     image: dpage/pgadmin4:9.14.0
@@ -55,6 +50,9 @@ services:
       interval: 30s
       timeout: 10s
       retries: 10
+    depends_on:
+      pgdatabase:
+        condition: service_started
 
   kestra:
     image: kestra/kestra:v1.3.8
@@ -103,16 +101,16 @@ services:
       kestra_postgres:
         condition: service_started
 
-  metabase:
-    image: metabase/metabase:v0.61.0.2-beta
+  streamlit:
+    build: ./dashboard
     environment:
-      MB_DB_TYPE: h2
-      MB_ADMIN_EMAIL: ${MB_ADMIN_EMAIL}
-      MB_ADMIN_PASSWORD: ${MB_ADMIN_PASSWORD}
-    volumes:
-      - metabase_data:/metabase-data
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      DB_HOST: pgdatabase
+      DB_PORT: 5432
     ports:
-      - "3000:3000"
+      - "8501:8501"
     depends_on:
       pgdatabase:
         condition: service_started
