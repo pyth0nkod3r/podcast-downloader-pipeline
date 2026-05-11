@@ -178,7 +178,7 @@ tasks:
 
   - id: if_yellow_table
     type: io.kestra.plugin.core.flow.If
-    condition: "{{ render(inputs.taxi == 'yellow')}}"
+    condition: "{{inputs.taxi == 'yellow'}}"
     then:
       - id: yellow_create_table
         type: io.kestra.plugin.jdbc.postgresql.Queries

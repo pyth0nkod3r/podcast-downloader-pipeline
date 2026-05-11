@@ -1,30 +1,13 @@
 id: rss-podcast-poc
 namespace: deeptech
+description: |
+  Main podcast pipeline: fetches RSS feeds from the catalog, extracts episode
+  metadata with enriched fields, loads into Postgres, and downloads audio files.
+  Loops over all active feeds in podcast_feeds.
 
 concurrency:
   limit: 1
   behavior: QUEUE
-
-inputs:
-  - id: rss_url
-    type: SELECT
-    displayName: Select rss feed
-    required: true
-    values: [ "commit_your_code", "tech_news", "simplecast_demo" ]
-    defaults: "commit_your_code"
-
-  - id: execution_mode
-    type: SELECT
-    defaults: manual
-    values:
-      - manual
-      - scheduled
-
-variables:
-  rss_mapping:
-    commit_your_code: https://anchor.fm/s/1cd48480/podcast/rss
-    tech_news: https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml
-    simplecast_demo: https://feeds.simplecast.com/54nAGcIl
 
 tasks:
 
@@ -46,356 +29,437 @@ tasks:
           is_backfill: "false"
           trigger_date: none
 
-  - id: set_label
-    type: io.kestra.plugin.core.execution.Labels
-    labels:
-      rssUrl: "{{inputs.rss_url}}"
-      execution_mode: "{{inputs.execution_mode}}"
-
-  #-----EXTRACTION......
-  # Fetch rss
-  - id: rss_fetch
-    type: io.kestra.plugin.core.http.Download
-    uri: "{{vars.rss_mapping[inputs.rss_url]}}"
-    method: GET
-
-  #------NORMALIZATION-------
-  # xml to ion
-  - id: xml_to_ion
-    type: io.kestra.plugin.serdes.xml.XmlToIon
-    from: "{{outputs.rss_fetch.uri}}"
-
-  # ion to json
-  - id: ion_to_json
-    type: io.kestra.plugin.serdes.json.IonToJson
-    from: "{{outputs.xml_to_ion.uri}}"
-
-  # extraction and transformation
-  - id: extract_podcasts
-    type: io.kestra.plugin.scripts.python.Script
-    inputFiles:
-      json_data.json: "{{outputs.ion_to_json.uri}}"
-    outputFiles:
-      - podcast_data.csv
-    script: |
-      import json
-      import csv
-
-
-      #---helpers---
-      def extract_guid(guid_field):
-        if isinstance(guid_field, dict):
-          return guid_field.get("content")
-        return guid_field
-
-      def extract_creator(item):
-        return (
-        item.get("dc:creator")
-        or item.get("author")
-        or item.get("itunes:author")
-        )
-
-      def extract_audio_url(item):
-        enclosure = item.get("enclosure")
-        if isinstance(enclosure, dict):
-          return enclosure.get("@url") or enclosure.get("url")
-        return None
-
-
-      #---Load JSON--------
-
-      with open("json_data.json", "r", encoding="utf-8") as f:
-        raw_json = json.load(f)
-      items = raw_json["rss"]["channel"]["item"]
-
-      #----Transform data----------
-      source = "{{inputs.rss_url}}"
-
-      result = [
-        {
-          "title": item.get("title"),
-          "link": item.get("link"),
-          "description": item.get("description"),
-          "duration": item.get("itunes:duration"),
-          "creator": extract_creator(item),
-          "pubDate": item.get("pubDate"),
-          "guid": extract_guid(item.get("guid")),
-          "audio_url": extract_audio_url(item),
-          "source": source
-        }
-        for item in items
-      ]
-      # print(f'result:{result}')
-      print(f"Extracted {len(result)} episodes")
-
-      #----Write CSV------
-
-      with open('podcast_data.csv', 'w', newline='', encoding="utf-8") as file:
-        writer = csv.DictWriter(
-        file,
-        fieldnames=[
-          "guid",
-          "title",
-          "link",
-          "description",
-          "duration",
-          "creator",
-          "pubDate",
-          "audio_url",
-          "source"
-          ],
-          quoting=csv.QUOTE_MINIMAL
-        )
-
-        cleaned = [r for r in result if r["guid"] and r["title"]]
-        print(f"Valid records: {len(cleaned)} / {len(result)}")
-
-        writer.writeheader()
-        writer.writerows(cleaned)
-
-        invalid = [r for r in result if not (r["guid"] and r["title"])]
-        print(f"Invalid records dropped: {len(invalid)}")
-
-      print("=== PIPELINE SUMMARY ===")
-      print(f"Feed: {source}")
-      print(f"Total extracted: {len(result)}")
-      print(f"Valid records: {len(cleaned)}")
-      print(f"Execution time: {{ now() }}")
-
-      #----Write audio URL list for download loop------
-      import json as _json
-      audio_items = [
-        {"guid": r["guid"], "audio_url": r["audio_url"], "title": r["title"]}
-        for r in cleaned if r.get("audio_url")
-      ]
-      with open("audio_urls.json", "w", encoding="utf-8") as af:
-        _json.dump(audio_items, af)
-      print(f"Audio URLs to download: {len(audio_items)}")
-
-  # Postgres
-  - id: create_table
+  # ===== Stage 5: Log pipeline start =====
+  - id: start_log
     type: io.kestra.plugin.jdbc.postgresql.Queries
     sql: |
-      CREATE TABLE IF NOT EXISTS podcast_metadata (
-      guid TEXT PRIMARY KEY,
-      title TEXT,
-      link TEXT,
-      description TEXT,
-      duration TEXT,
-      creator TEXT,
-      pubDate TEXT,
-      audio_url TEXT,
-      created_at TIMESTAMP DEFAULT NOW(),
-      source TEXT
-      )
+      INSERT INTO pipeline_run_log (run_id, flow_id, started_at, status)
+      VALUES ('{{ execution.id }}', 'rss-podcast-poc', NOW(), 'running')
+      ON CONFLICT (run_id) DO NOTHING;
 
-  - id: create_staging_table
+  # ===== Stage 1c: Fetch active feeds from catalog =====
+  - id: fetch_active_feeds
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    sql: |
+      SELECT feed_id, feed_name, rss_url, category
+      FROM podcast_feeds
+      WHERE is_active = TRUE
+      ORDER BY feed_id
+    fetchType: FETCH
+
+  # ===== Loop over each feed =====
+  - id: process_feeds
+    type: io.kestra.plugin.core.flow.EachSequential
+    value: "{{ outputs.fetch_active_feeds.rows }}"
+    tasks:
+
+      - id: set_feed_label
+        type: io.kestra.plugin.core.execution.Labels
+        labels:
+          current_feed: "{{ taskrun.value.feed_name }}"
+
+      # Fetch RSS
+      - id: rss_fetch
+        type: io.kestra.plugin.core.http.Download
+        uri: "{{ taskrun.value.rss_url }}"
+        method: GET
+        options:
+          connectTimeout: PT30S
+          readTimeout: PT30S
+
+      # XML → ION
+      - id: xml_to_ion
+        type: io.kestra.plugin.serdes.xml.XmlToIon
+        from: "{{ outputs.rss_fetch.uri }}"
+
+      # ION → JSON
+      - id: ion_to_json
+        type: io.kestra.plugin.serdes.json.IonToJson
+        from: "{{ outputs.xml_to_ion.uri }}"
+
+      # Extract & transform episodes with enriched fields
+      - id: extract_podcasts
+        type: io.kestra.plugin.scripts.python.Script
+        inputFiles:
+          json_data.json: "{{ outputs.ion_to_json.uri }}"
+        outputFiles:
+          - podcast_data.csv
+          - audio_urls.json
+        script: |
+          import json
+          import csv
+          import re
+          from email.utils import parsedate_to_datetime
+
+          # ---helpers---
+          def extract_guid(guid_field):
+            if isinstance(guid_field, dict):
+              return guid_field.get("content")
+            return guid_field
+
+          def extract_creator(item):
+            return (
+              item.get("dc:creator")
+              or item.get("author")
+              or item.get("itunes:author")
+            )
+
+          def extract_audio_url(item):
+            enclosure = item.get("enclosure")
+            if isinstance(enclosure, dict):
+              return enclosure.get("@url") or enclosure.get("url")
+            return None
+
+          def parse_duration(duration_str):
+            """Converts itunes:duration to total seconds.
+            Handles formats: '3600', '1:00:00', '60:00'
+            """
+            if not duration_str:
+              return None
+            try:
+              parts = str(duration_str).strip().split(':')
+              if len(parts) == 1:
+                return int(parts[0])
+              elif len(parts) == 2:
+                return int(parts[0]) * 60 + int(parts[1])
+              elif len(parts) == 3:
+                return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+            except (ValueError, AttributeError):
+              return None
+
+          def parse_pub_date(date_str):
+            """Parses RSS pubDate strings into ISO format."""
+            if not date_str:
+              return None
+            try:
+              return parsedate_to_datetime(str(date_str)).isoformat()
+            except Exception:
+              return None
+
+          def word_count(text):
+            """Counts words in a string, handling None safely."""
+            if not text:
+              return 0
+            return len(re.findall(r'\w+', str(text)))
+
+          def parse_explicit(explicit_str):
+            """Converts itunes:explicit to a boolean."""
+            if not explicit_str:
+              return False
+            return str(explicit_str).strip().lower() in ('yes', 'true', '1', 'explicit')
+
+          def parse_file_size(item):
+            """Extracts file size in bytes from the enclosure tag."""
+            enclosure = item.get('enclosure', {})
+            if isinstance(enclosure, dict):
+              try:
+                return int(enclosure.get('@length') or enclosure.get('length') or 0) or None
+              except (ValueError, TypeError):
+                return None
+            return None
+
+          # ---Load JSON---
+          with open("json_data.json", "r", encoding="utf-8") as f:
+            raw_json = json.load(f)
+
+          # Handle feeds where channel.item may be a single dict (1 episode) or a list
+          channel = raw_json.get("rss", {}).get("channel", {})
+          items = channel.get("item", [])
+          if isinstance(items, dict):
+            items = [items]
+
+          # ---Transform data---
+          source = "{{ taskrun.value.feed_name }}"
+          feed_category = "{{ taskrun.value.category }}"
+
+          result = [
+            {
+              "title":                  item.get("title"),
+              "link":                   item.get("link"),
+              "description":            item.get("description"),
+              "duration":               item.get("itunes:duration"),
+              "duration_seconds":       parse_duration(item.get("itunes:duration")),
+              "creator":                extract_creator(item),
+              "pubDate":                item.get("pubDate"),
+              "pub_date":               parse_pub_date(item.get("pubDate")),
+              "guid":                   extract_guid(item.get("guid")),
+              "audio_url":              extract_audio_url(item),
+              "source":                 source,
+              "episode_number":         item.get("itunes:episode"),
+              "season_number":          item.get("itunes:season"),
+              "category":               item.get("itunes:category") or feed_category,
+              "keywords":               item.get("itunes:keywords"),
+              "description_word_count": word_count(item.get("description")),
+              "audio_file_size_bytes":  parse_file_size(item),
+              "explicit":               parse_explicit(item.get("itunes:explicit")),
+              "image_url":              (item.get("itunes:image") or {}).get("@href"),
+            }
+            for item in items
+          ]
+          print(f"Extracted {len(result)} episodes from {source}")
+
+          # ---Write CSV---
+          fieldnames = [
+            "guid", "title", "link", "description", "duration",
+            "duration_seconds", "creator", "pubDate", "pub_date",
+            "audio_url", "source", "episode_number", "season_number",
+            "category", "keywords", "description_word_count",
+            "audio_file_size_bytes", "explicit", "image_url"
+          ]
+
+          with open('podcast_data.csv', 'w', newline='', encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL)
+            cleaned = [r for r in result if r["guid"] and r["title"]]
+            print(f"Valid records: {len(cleaned)} / {len(result)}")
+            writer.writeheader()
+            writer.writerows(cleaned)
+            invalid = [r for r in result if not (r["guid"] and r["title"])]
+            print(f"Invalid records dropped: {len(invalid)}")
+
+          # ---Write audio URL list for download loop---
+          audio_items = [
+            {"guid": r["guid"], "audio_url": r["audio_url"], "title": r["title"]}
+            for r in cleaned if r.get("audio_url")
+          ]
+          with open("audio_urls.json", "w", encoding="utf-8") as af:
+            json.dump(audio_items, af)
+
+          print(f"=== PIPELINE SUMMARY ===")
+          print(f"Feed: {source}")
+          print(f"Total extracted: {len(result)}")
+          print(f"Valid records: {len(cleaned)}")
+          print(f"Audio URLs to download: {len(audio_items)}")
+
+      # Create staging table with enriched columns
+      - id: create_staging_table
+        type: io.kestra.plugin.jdbc.postgresql.Queries
+        sql: |
+          DROP TABLE IF EXISTS podcast_staging;
+          CREATE TABLE podcast_staging (
+            guid                    TEXT,
+            title                   TEXT,
+            link                    TEXT,
+            description             TEXT,
+            duration                TEXT,
+            duration_seconds        INTEGER,
+            creator                 TEXT,
+            pubDate                 TEXT,
+            pub_date                TIMESTAMP,
+            audio_url               TEXT,
+            source                  TEXT,
+            episode_number          INTEGER,
+            season_number           INTEGER,
+            category                TEXT,
+            keywords                TEXT,
+            description_word_count  INTEGER,
+            audio_file_size_bytes   BIGINT,
+            explicit                BOOLEAN,
+            image_url               TEXT
+          );
+
+      # Load CSV into staging
+      - id: load_staging_table
+        type: io.kestra.plugin.jdbc.postgresql.CopyIn
+        format: CSV
+        from: "{{ outputs.extract_podcasts.outputFiles['podcast_data.csv'] }}"
+        table: podcast_staging
+        columns:
+          - guid
+          - title
+          - link
+          - description
+          - duration
+          - duration_seconds
+          - creator
+          - pubDate
+          - pub_date
+          - audio_url
+          - source
+          - episode_number
+          - season_number
+          - category
+          - keywords
+          - description_word_count
+          - audio_file_size_bytes
+          - explicit
+          - image_url
+
+      # Merge staging → metadata
+      - id: store_podcast_metadata
+        type: io.kestra.plugin.jdbc.postgresql.Queries
+        sql: |
+          MERGE INTO podcast_metadata AS PM
+          USING podcast_staging AS PS
+          ON PM.guid = PS.guid
+          WHEN NOT MATCHED THEN
+            INSERT (
+              guid, title, link, description, duration, duration_seconds,
+              creator, pubDate, pub_date, audio_url, source,
+              episode_number, season_number, category, keywords,
+              description_word_count, audio_file_size_bytes, explicit, image_url
+            )
+            VALUES (
+              PS.guid, PS.title, PS.link, PS.description, PS.duration, PS.duration_seconds,
+              PS.creator, PS.pubDate, PS.pub_date, PS.audio_url, PS.source,
+              PS.episode_number, PS.season_number, PS.category, PS.keywords,
+              PS.description_word_count, PS.audio_file_size_bytes, PS.explicit, PS.image_url
+            );
+
+      # Update last_fetched_at for this feed
+      - id: update_feed_timestamp
+        type: io.kestra.plugin.jdbc.postgresql.Queries
+        sql: |
+          UPDATE podcast_feeds
+          SET last_fetched_at = NOW()
+          WHERE rss_url = '{{ taskrun.value.rss_url }}';
+
+      # ===== Audio Download =====
+      - id: download_audio
+        type: io.kestra.plugin.scripts.python.Script
+        inputFiles:
+          audio_urls.json: "{{ outputs.extract_podcasts.outputFiles['audio_urls.json'] }}"
+        outputFiles:
+          - download_results.csv
+        script: |
+          import json
+          import os
+          import re
+          import time
+          import requests
+
+          AUDIO_DIR = "/app/storage/audio"
+          os.makedirs(AUDIO_DIR, exist_ok=True)
+          MAX_RETRIES = 3
+
+          def sanitize_title(title):
+            """Convert episode title to a safe filename."""
+            safe = re.sub(r'[^\w\s-]', '', title or 'unknown')
+            safe = re.sub(r'[\s_]+', '_', safe).strip('_')
+            return safe[:100]
+
+          with open("audio_urls.json", "r", encoding="utf-8") as f:
+            items = json.load(f)
+
+          results = []
+          for item in items:
+            guid = item["guid"]
+            url = item["audio_url"]
+            title = item.get("title", guid)
+            filename = sanitize_title(title) + ".mp3"
+            filepath = os.path.join(AUDIO_DIR, filename)
+
+            # Skip if already downloaded
+            if os.path.exists(filepath):
+              print(f"[SKIP] Already exists: {filename}")
+              results.append({"guid": guid, "file_path": filepath, "status": "skipped"})
+              continue
+
+            # Retry logic (Stage 6)
+            success = False
+            for attempt in range(1, MAX_RETRIES + 1):
+              try:
+                response = requests.get(url, stream=True, timeout=60)
+                response.raise_for_status()
+                with open(filepath, "wb") as audio_file:
+                  for chunk in response.iter_content(chunk_size=8192):
+                    audio_file.write(chunk)
+                print(f"[OK] Downloaded: {filename}")
+                results.append({"guid": guid, "file_path": filepath, "status": "success"})
+                success = True
+                break
+              except Exception as e:
+                print(f"[RETRY {attempt}/{MAX_RETRIES}] {filename}: {e}")
+                if attempt < MAX_RETRIES:
+                  time.sleep(2)
+
+            if not success:
+              print(f"[FAIL] {filename}: all {MAX_RETRIES} retries exhausted")
+              results.append({"guid": guid, "file_path": "", "status": "failed"})
+
+          import csv
+          with open("download_results.csv", "w", newline="", encoding="utf-8") as rf:
+            writer = csv.DictWriter(rf, fieldnames=["guid", "file_path", "status"])
+            writer.writeheader()
+            writer.writerows(results)
+
+          ok = sum(1 for r in results if r["status"] == "success")
+          skip = sum(1 for r in results if r["status"] == "skipped")
+          fail = sum(1 for r in results if r["status"] == "failed")
+          print(f"=== AUDIO DOWNLOAD SUMMARY ===")
+          print(f"Downloaded: {ok} | Skipped (exists): {skip} | Failed: {fail}")
+
+      # Create downloads staging
+      - id: create_downloads_staging
+        type: io.kestra.plugin.jdbc.postgresql.Queries
+        sql: |
+          DROP TABLE IF EXISTS podcast_downloads_staging;
+          CREATE TABLE podcast_downloads_staging (
+            guid      TEXT,
+            file_path TEXT,
+            status    TEXT
+          );
+
+      # Load download results into staging
+      - id: load_downloads_staging
+        type: io.kestra.plugin.jdbc.postgresql.CopyIn
+        format: CSV
+        from: "{{ outputs.download_audio.outputFiles['download_results.csv'] }}"
+        table: podcast_downloads_staging
+        columns:
+          - guid
+          - file_path
+          - status
+
+      # Merge downloads
+      - id: merge_downloads
+        type: io.kestra.plugin.jdbc.postgresql.Queries
+        sql: |
+          MERGE INTO podcast_downloads AS PD
+          USING podcast_downloads_staging AS PDS
+          ON PD.guid = PDS.guid
+          WHEN MATCHED THEN
+            UPDATE SET
+              file_path     = PDS.file_path,
+              status        = PDS.status,
+              downloaded_at = NOW()
+          WHEN NOT MATCHED THEN
+            INSERT (guid, file_path, status, downloaded_at)
+            VALUES (PDS.guid, PDS.file_path, PDS.status, NOW());
+
+  # ===== Stage 5: Log pipeline completion =====
+  - id: update_log
     type: io.kestra.plugin.jdbc.postgresql.Queries
     sql: |
-      DROP TABLE IF EXISTS podcast_staging;
-      CREATE TABLE podcast_staging (
-      guid TEXT,
-      title TEXT,
-      link TEXT,
-      description TEXT,
-      duration TEXT,
-      creator TEXT,
-      pubDate TEXT,
-      audio_url TEXT,
-      source TEXT
-      )
-
-  - id: load_staging_table
-    type: io.kestra.plugin.jdbc.postgresql.CopyIn
-    format: CSV
-    from: "{{render(outputs.extract_podcasts.outputFiles['podcast_data.csv'])}}"
-    table: podcast_staging
-    columns:
-      - guid
-      - title
-      - link
-      - description
-      - duration
-      - creator
-      - pubDate
-      - audio_url
-      - source
-
-  - id: store_podcast_metadata
-    type: io.kestra.plugin.jdbc.postgresql.Queries
-    sql: |
-      MERGE INTO podcast_metadata as PM
-      USING podcast_staging as PS
-      ON PM.guid = PS.guid
-      WHEN NOT MATCHED THEN
-      INSERT (
-      guid,
-      title,
-      link,
-      description,
-      duration,
-      creator,
-      pubDate,
-      audio_url,
-      source
-      )
-      VALUES (
-      PS.guid,
-      PS.title,
-      PS.link,
-      PS.description,
-      PS.duration,
-      PS.creator,
-      PS.pubDate,
-      PS.audio_url,
-      PS.source
-      )
-
-  #------AUDIO DOWNLOAD-------
-  # Downloads each audio file to the persistent /app/storage/audio volume.
-  # Files are named by sanitized episode title so they are human-readable.
-  - id: download_audio
-    type: io.kestra.plugin.scripts.python.Script
-    inputFiles:
-      audio_urls.json: "{{render(outputs.extract_podcasts.outputFiles['audio_urls.json'])}}"
-    outputFiles:
-      - download_results.csv
-    script: |
-      import json
-      import os
-      import re
-      import requests
-
-      AUDIO_DIR = "/app/storage/audio"
-      os.makedirs(AUDIO_DIR, exist_ok=True)
-
-      def sanitize_title(title):
-        """Convert episode title to a safe filename."""
-        safe = re.sub(r'[^\w\s-]', '', title or 'unknown')
-        safe = re.sub(r'[\s_]+', '_', safe).strip('_')
-        return safe[:100]  # cap filename length
-
-      with open("audio_urls.json", "r", encoding="utf-8") as f:
-        items = json.load(f)
-
-      results = []
-      for item in items:
-        guid = item["guid"]
-        url = item["audio_url"]
-        title = item.get("title", guid)
-        filename = sanitize_title(title) + ".mp3"
-        filepath = os.path.join(AUDIO_DIR, filename)
-
-        # Skip if already downloaded
-        if os.path.exists(filepath):
-          print(f"[SKIP] Already exists: {filename}")
-          results.append({"guid": guid, "file_path": filepath, "status": "skipped"})
-          continue
-
-        try:
-          response = requests.get(url, stream=True, timeout=60)
-          response.raise_for_status()
-          with open(filepath, "wb") as audio_file:
-            for chunk in response.iter_content(chunk_size=8192):
-              audio_file.write(chunk)
-          print(f"[OK] Downloaded: {filename}")
-          results.append({"guid": guid, "file_path": filepath, "status": "success"})
-        except Exception as e:
-          print(f"[FAIL] {filename}: {e}")
-          results.append({"guid": guid, "file_path": "", "status": f"error: {e}"})
-
-      with open("download_results.csv", "w", newline="", encoding="utf-8") as rf:
-        import csv
-        writer = csv.DictWriter(rf, fieldnames=["guid", "file_path", "status"])
-        writer.writeheader()
-        writer.writerows([{"guid": r["guid"], "file_path": r["file_path"], "status": r["status"]} for r in results])
-
-      ok = sum(1 for r in results if r["status"] == "success")
-      skip = sum(1 for r in results if r["status"] == "skipped")
-      fail = sum(1 for r in results if r["status"].startswith("error"))
-      print(f"=== AUDIO DOWNLOAD SUMMARY ===")
-      print(f"Downloaded: {ok} | Skipped (exists): {skip} | Failed: {fail}")
-
-  #------DOWNLOAD TRACKING-------
-  - id: create_downloads_table
-    type: io.kestra.plugin.jdbc.postgresql.Queries
-    sql: |
-      CREATE TABLE IF NOT EXISTS podcast_downloads (
-        guid       TEXT PRIMARY KEY,
-        file_path  TEXT,
-        status     TEXT,
-        downloaded_at TIMESTAMP DEFAULT NOW()
-      )
-
-  - id: create_downloads_staging
-    type: io.kestra.plugin.jdbc.postgresql.Queries
-    sql: |
-      DROP TABLE IF EXISTS podcast_downloads_staging;
-      CREATE TABLE podcast_downloads_staging (
-        guid      TEXT,
-        file_path TEXT,
-        status    TEXT
-      )
-
-  - id: load_downloads_staging
-    type: io.kestra.plugin.jdbc.postgresql.CopyIn
-    format: CSV
-    from: "{{render(outputs.download_audio.outputFiles['download_results.csv'])}}"
-    table: podcast_downloads_staging
-    columns:
-      - guid
-      - file_path
-      - status
-
-  - id: merge_downloads
-    type: io.kestra.plugin.jdbc.postgresql.Queries
-    sql: |
-      MERGE INTO podcast_downloads AS PD
-      USING podcast_downloads_staging AS PDS
-      ON PD.guid = PDS.guid
-      WHEN MATCHED THEN
-        UPDATE SET
-          file_path    = PDS.file_path,
-          status       = PDS.status,
-          downloaded_at = NOW()
-      WHEN NOT MATCHED THEN
-        INSERT (guid, file_path, status, downloaded_at)
-        VALUES (PDS.guid, PDS.file_path, PDS.status, NOW())
+      UPDATE pipeline_run_log
+      SET
+        finished_at = NOW(),
+        status = 'success'
+      WHERE run_id = '{{ execution.id }}';
 
   - id: purge_files
     type: io.kestra.plugin.core.storage.PurgeCurrentExecutionFiles
     description: Remove intermediate CSV/JSON files; audio files are already persisted to the podcast_audio volume.
-    include:
-      - "podcast_data.csv"
-      - "audio_urls.json"
-      - "download_results.csv"
 
+# ===== Stage 5: Error handler =====
+errors:
+  - id: log_failure
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
+      UPDATE pipeline_run_log
+      SET
+        finished_at = NOW(),
+        status = 'failed',
+        error_message = '{{ execution.id }} failed'
+      WHERE run_id = '{{ execution.id }}';
 
 pluginDefaults:
   - type: io.kestra.plugin.jdbc.postgresql
     values:
-      url: jdbc:postgresql://pgdatabase:5432/podcast_db
-      username: "{{ secret('POSTGRES_USERNAME') }}"
-      password: "{{ secret('POSTGRES_PASSWORD') }}"
+      url: jdbc:postgresql://{{ secret('DB_HOST') }}:{{ secret('DB_PORT') }}/{{ secret('DB_NAME') }}
+      username: "{{ secret('DB_USER') }}"
+      password: "{{ secret('DB_PASSWORD') }}"
 
 triggers:
-  - id: tech_news_schedule
+  - id: hourly_schedule
     type: io.kestra.plugin.core.trigger.Schedule
     cron: "0 * * * *"
-    inputs:
-      rss_url: tech_news
-      execution_mode: scheduled
-
-  - id: commit_your_code_schedule
-    type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0 * * * *"
-    inputs:
-      rss_url: commit_your_code
-      execution_mode: scheduled
-
-  - id: simplecast_schedule
-    type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0 * * * *"
-    inputs:
-      rss_url: simplecast_demo
-      execution_mode: scheduled

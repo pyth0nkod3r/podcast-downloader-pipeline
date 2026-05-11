@@ -1,0 +1,78 @@
+id: seed-feeds
+namespace: deeptech
+description: |
+  Seeds the podcast_feeds table with the RSS feed catalog.
+  Safe to re-run — uses INSERT ... ON CONFLICT DO NOTHING.
+  Run this once after init-schema has been executed.
+
+tasks:
+
+  - id: seed_feed_catalog
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Inserts 48 feeds across 7 categories into podcast_feeds.
+    sql: |
+      INSERT INTO podcast_feeds (feed_name, rss_url, category) VALUES
+      ('Syntax.fm', 'https://feed.syntax.fm/rss', 'Technology'),
+      ('The Changelog', 'https://changelog.com/podcast/feed', 'Technology'),
+      ('Software Engineering Daily', 'https://softwareengineeringdaily.com/feed/podcast/', 'Technology'),
+      ('Darknet Diaries', 'https://feeds.megaphone.fm/darknetdiaries', 'Technology'),
+      ('Command Line Heroes', 'https://feeds.pacific-content.com/commandlineheroes', 'Technology'),
+      ('Hanselminutes', 'https://feeds.simplecast.com/gvtxUiIf', 'Technology'),
+      ('The Stack Overflow Podcast', 'https://feeds.simplecast.com/XA_851k3', 'Technology'),
+      ('JS Party', 'https://changelog.com/jsparty/feed', 'Technology'),
+      ('Go Time', 'https://changelog.com/gotime/feed', 'Technology'),
+      ('Practical AI', 'https://changelog.com/practicalai/feed', 'Technology'),
+      ('Lex Fridman Podcast', 'https://lexfridman.com/feed/podcast/', 'Technology'),
+      ('CoRecursive', 'https://corecursive.com/feed', 'Technology'),
+      ('Ship It!', 'https://changelog.com/shipit/feed', 'Technology'),
+      ('Developer Tea', 'https://feeds.simplecast.com/dCXMIpJz', 'Technology'),
+
+      ('Radiolab', 'https://feeds.simplecast.com/EmVW7VGp', 'Science'),
+      ('Science Vs', 'https://feeds.megaphone.fm/sciencevs', 'Science'),
+      ('Huberman Lab', 'https://feeds.megaphone.fm/hubermanlab', 'Science'),
+      ('Hidden Brain', 'https://feeds.npr.org/510308/podcast.xml', 'Science'),
+      ('Freakonomics Radio', 'https://feeds.simplecast.com/Y8lFbOT4', 'Science'),
+      ('Short Wave (NPR)', 'https://feeds.npr.org/510351/podcast.xml', 'Science'),
+
+      ('How I Built This', 'https://feeds.npr.org/510313/podcast.xml', 'Business & Finance'),
+      ('Masters of Scale', 'https://rss.art19.com/masters-of-scale', 'Business & Finance'),
+      ('Planet Money', 'https://feeds.npr.org/510289/podcast.xml', 'Business & Finance'),
+      ('The Tim Ferriss Show', 'https://rss.art19.com/tim-ferriss-show', 'Business & Finance'),
+      ('My First Million', 'https://feeds.megaphone.fm/myfirstmillion', 'Business & Finance'),
+      ('Acquired', 'https://feeds.simplecast.com/lt2IQZL6', 'Business & Finance'),
+      ('Invest Like the Best', 'https://feeds.megaphone.fm/investlikethebest', 'Business & Finance'),
+      ('The Knowledge Project', 'https://feeds.simplecast.com/lG6dOVHY', 'Business & Finance'),
+      ('Founders', 'https://feeds.simplecast.com/h0lGRWvg', 'Business & Finance'),
+
+      ('Serial', 'https://feeds.serialpodcast.org/serialpodcast', 'True Crime & Storytelling'),
+      ('Criminal', 'https://feeds.simplecast.com/4T3_oCr2', 'True Crime & Storytelling'),
+      ('This American Life', 'https://www.thisamericanlife.org/podcast/rss.xml', 'True Crime & Storytelling'),
+      ('Snap Judgment', 'https://feeds.feedburner.com/snapjudgment-hd', 'True Crime & Storytelling'),
+
+      ('Ten Percent Happier', 'https://feeds.simplecast.com/lRTUgHMO', 'Health & Wellness'),
+      ('The Model Health Show', 'https://feeds.simplecast.com/nqZCKqlS', 'Health & Wellness'),
+
+      ('The Daily (NYT)', 'https://feeds.simplecast.com/54nAGcIl', 'News & Politics'),
+      ('Up First (NPR)', 'https://feeds.npr.org/510318/podcast.xml', 'News & Politics'),
+      ('The Indicator from Planet Money', 'https://feeds.npr.org/510325/podcast.xml', 'News & Politics'),
+      ('Axios Today', 'https://feeds.simplecast.com/l8BF1NN7', 'News & Politics'),
+
+      ('Conan O''Brien Needs a Friend', 'https://feeds.simplecast.com/dHoohVNH', 'Comedy & Culture'),
+      ('SmartLess', 'https://feeds.simplecast.com/pHMEHy5M', 'Comedy & Culture'),
+      ('Wait Wait Don''t Tell Me', 'https://feeds.npr.org/344098539/podcast.xml', 'Comedy & Culture'),
+      ('Pop Culture Happy Hour', 'https://feeds.npr.org/510282/podcast.xml', 'Comedy & Culture'),
+
+      ('Data Skeptic', 'https://dataskeptic.com/feed.rss', 'Data, AI & Learning'),
+      ('DataFramed', 'https://feeds.buzzsprout.com/394933.rss', 'Data, AI & Learning'),
+      ('Ologies with Alie Ward', 'https://feeds.simplecast.com/JRFZ3dAK', 'Data, AI & Learning'),
+
+      ('Commit Your Code', 'https://anchor.fm/s/1cd48480/podcast/rss', 'Technology'),
+      ('NYT Technology News', 'https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml', 'News & Politics')
+      ON CONFLICT (rss_url) DO NOTHING;
+
+pluginDefaults:
+  - type: io.kestra.plugin.jdbc.postgresql
+    values:
+      url: jdbc:postgresql://{{ secret('DB_HOST') }}:{{ secret('DB_PORT') }}/{{ secret('DB_NAME') }}
+      username: "{{ secret('DB_USER') }}"
+      password: "{{ secret('DB_PASSWORD') }}"
