@@ -1,4 +1,4 @@
-id: seed-feeds
+id: 3mtt_seed-feeds
 namespace: deeptech
 description: |
   Seeds the podcast_feeds table with the RSS feed catalog.
@@ -75,4 +75,4 @@ pluginDefaults:
     values:
       url: jdbc:postgresql://{{ secret('DB_HOST') }}:{{ secret('DB_PORT') }}/{{ secret('DB_NAME') }}
       username: "{{ secret('DB_USER') }}"
-      password: "{{ secret('DB_PASSWORD') }}"
+      password: "{{ secret('DB_PASSWORD') }}a"

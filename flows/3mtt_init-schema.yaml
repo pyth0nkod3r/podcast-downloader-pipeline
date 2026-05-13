@@ -1,4 +1,4 @@
-id: init-schema
+id: 3mtt_init-schema
 namespace: deeptech
 description: |
   Creates all database tables and views for the podcast pipeline.
@@ -139,7 +139,7 @@ tasks:
         MIN(pub_date)                         AS oldest_episode_date,
         ROUND(AVG(description_word_count),0)  AS avg_description_words,
         SUM(CASE WHEN explicit THEN 1 ELSE 0 END) AS explicit_episode_count,
-        SUM(CASE WHEN audio_url IS NOT NULL THEN 1 ELSE 0 END) AS episodes_with_audio,
+        SUM(CASE WHEN has_audio THEN 1 ELSE 0 END) AS episodes_with_audio,
         NOW() - MAX(pub_date)                 AS days_since_last_episode
       FROM v_episodes_clean
       GROUP BY source, category;

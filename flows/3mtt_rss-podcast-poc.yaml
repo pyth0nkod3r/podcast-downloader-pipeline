@@ -1,4 +1,4 @@
-id: rss-podcast-poc
+id: 3mtt_rss-podcast-poc
 namespace: deeptech
 description: |
   Main podcast pipeline: fetches RSS feeds from the catalog, extracts episode
@@ -53,15 +53,10 @@ tasks:
     value: "{{ outputs.fetch_active_feeds.rows }}"
     tasks:
 
-      - id: set_feed_label
-        type: io.kestra.plugin.core.execution.Labels
-        labels:
-          current_feed: "{{ taskrun.value.feed_name }}"
-
       # Fetch RSS
       - id: rss_fetch
         type: io.kestra.plugin.core.http.Download
-        uri: "{{ taskrun.value.rss_url }}"
+        uri: "{{ fromJson(taskrun.value).rss_url }}"
         method: GET
         options:
           connectTimeout: PT30S
@@ -70,18 +65,18 @@ tasks:
       # XML → ION
       - id: xml_to_ion
         type: io.kestra.plugin.serdes.xml.XmlToIon
-        from: "{{ outputs.rss_fetch.uri }}"
+        from: "{{ outputs.rss_fetch[taskrun.value].uri }}"
 
       # ION → JSON
       - id: ion_to_json
         type: io.kestra.plugin.serdes.json.IonToJson
-        from: "{{ outputs.xml_to_ion.uri }}"
+        from: "{{ outputs.xml_to_ion[taskrun.value].uri }}"
 
       # Extract & transform episodes with enriched fields
       - id: extract_podcasts
         type: io.kestra.plugin.scripts.python.Script
         inputFiles:
-          json_data.json: "{{ outputs.ion_to_json.uri }}"
+          json_data.json: "{{ outputs.ion_to_json[taskrun.value].uri }}"
         outputFiles:
           - podcast_data.csv
           - audio_urls.json
@@ -169,8 +164,8 @@ tasks:
             items = [items]
 
           # ---Transform data---
-          source = "{{ taskrun.value.feed_name }}"
-          feed_category = "{{ taskrun.value.category }}"
+          source = "{{ fromJson(taskrun.value).feed_name }}"
+          feed_category = "{{ fromJson(taskrun.value).category }}"
 
           result = [
             {
@@ -234,8 +229,7 @@ tasks:
       - id: create_staging_table
         type: io.kestra.plugin.jdbc.postgresql.Queries
         sql: |
-          DROP TABLE IF EXISTS podcast_staging;
-          CREATE TABLE podcast_staging (
+          CREATE TABLE IF NOT EXISTS podcast_staging (
             guid                    TEXT,
             title                   TEXT,
             link                    TEXT,
@@ -256,12 +250,13 @@ tasks:
             explicit                BOOLEAN,
             image_url               TEXT
           );
+          TRUNCATE TABLE podcast_staging;
 
       # Load CSV into staging
       - id: load_staging_table
         type: io.kestra.plugin.jdbc.postgresql.CopyIn
         format: CSV
-        from: "{{ outputs.extract_podcasts.outputFiles['podcast_data.csv'] }}"
+        from: "{{ outputs.extract_podcasts[taskrun.value].outputFiles['podcast_data.csv'] }}"
         table: podcast_staging
         columns:
           - guid
@@ -311,13 +306,13 @@ tasks:
         sql: |
           UPDATE podcast_feeds
           SET last_fetched_at = NOW()
-          WHERE rss_url = '{{ taskrun.value.rss_url }}';
+          WHERE rss_url = '{{ fromJson(taskrun.value).rss_url }}';
 
       # ===== Audio Download =====
       - id: download_audio
         type: io.kestra.plugin.scripts.python.Script
         inputFiles:
-          audio_urls.json: "{{ outputs.extract_podcasts.outputFiles['audio_urls.json'] }}"
+          audio_urls.json: "{{ outputs.extract_podcasts[taskrun.value].outputFiles['audio_urls.json'] }}"
         outputFiles:
           - download_results.csv
         script: |
@@ -392,18 +387,18 @@ tasks:
       - id: create_downloads_staging
         type: io.kestra.plugin.jdbc.postgresql.Queries
         sql: |
-          DROP TABLE IF EXISTS podcast_downloads_staging;
-          CREATE TABLE podcast_downloads_staging (
+          CREATE TABLE IF NOT EXISTS podcast_downloads_staging (
             guid      TEXT,
             file_path TEXT,
             status    TEXT
           );
+          TRUNCATE TABLE podcast_downloads_staging;
 
       # Load download results into staging
       - id: load_downloads_staging
         type: io.kestra.plugin.jdbc.postgresql.CopyIn
         format: CSV
-        from: "{{ outputs.download_audio.outputFiles['download_results.csv'] }}"
+        from: "{{ outputs.download_audio[taskrun.value].outputFiles['download_results.csv'] }}"
         table: podcast_downloads_staging
         columns:
           - guid

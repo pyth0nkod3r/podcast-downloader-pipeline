@@ -1,0 +1,234 @@
+id: 3mtt_ingest-metadata
+namespace: deeptech
+description: |
+  Metadata-only pipeline: fetches RSS feeds from the catalog, extracts
+  enriched episode metadata, and loads into Postgres. Runs hourly.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+tasks:
+
+  - id: start_log
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
+      INSERT INTO pipeline_run_log (run_id, flow_id, started_at, status)
+      VALUES ('{{ execution.id }}', 'ingest-metadata', NOW(), 'running')
+      ON CONFLICT (run_id) DO NOTHING;
+
+  - id: fetch_active_feeds
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    sql: |
+      SELECT feed_id, feed_name, rss_url, category
+      FROM podcast_feeds
+      WHERE is_active = TRUE
+      ORDER BY feed_id
+    fetchType: FETCH
+
+  - id: process_feeds
+    type: io.kestra.plugin.core.flow.EachSequential
+    value: "{{ outputs.fetch_active_feeds.rows }}"
+    tasks:
+
+      - id: rss_fetch
+        type: io.kestra.plugin.core.http.Download
+        uri: "{{ fromJson(taskrun.value).rss_url }}"
+        method: GET
+        options:
+          connectTimeout: PT30S
+          readTimeout: PT30S
+
+      - id: xml_to_ion
+        type: io.kestra.plugin.serdes.xml.XmlToIon
+        from: "{{ outputs.rss_fetch[taskrun.value].uri }}"
+
+      - id: ion_to_json
+        type: io.kestra.plugin.serdes.json.IonToJson
+        from: "{{ outputs.xml_to_ion[taskrun.value].uri }}"
+
+      - id: extract_podcasts
+        type: io.kestra.plugin.scripts.python.Script
+        inputFiles:
+          json_data.json: "{{ outputs.ion_to_json[taskrun.value].uri }}"
+        outputFiles:
+          - podcast_data.csv
+        script: |
+          import json, csv, re
+          from email.utils import parsedate_to_datetime
+
+          def extract_guid(g):
+            return g.get("content") if isinstance(g, dict) else g
+
+          def extract_creator(item):
+            return item.get("dc:creator") or item.get("author") or item.get("itunes:author")
+
+          def extract_audio_url(item):
+            enc = item.get("enclosure")
+            return (enc.get("@url") or enc.get("url")) if isinstance(enc, dict) else None
+
+          def parse_duration(s):
+            if not s: return None
+            try:
+              parts = str(s).strip().split(':')
+              if len(parts)==1: return int(parts[0])
+              elif len(parts)==2: return int(parts[0])*60+int(parts[1])
+              elif len(parts)==3: return int(parts[0])*3600+int(parts[1])*60+int(parts[2])
+            except: return None
+
+          def parse_pub_date(s):
+            if not s: return None
+            try: return parsedate_to_datetime(str(s)).isoformat()
+            except: return None
+
+          def word_count(t):
+            return len(re.findall(r'\w+', str(t))) if t else 0
+
+          def parse_explicit(s):
+            return str(s).strip().lower() in ('yes','true','1','explicit') if s else False
+
+          def parse_file_size(item):
+            enc = item.get('enclosure', {})
+            if isinstance(enc, dict):
+              try: return int(enc.get('@length') or enc.get('length') or 0) or None
+              except: return None
+            return None
+
+          with open("json_data.json","r",encoding="utf-8") as f:
+            raw = json.load(f)
+
+          channel = raw.get("rss",{}).get("channel",{})
+          items = channel.get("item",[])
+          if isinstance(items,dict): items=[items]
+
+          source = "{{ fromJson(taskrun.value).feed_name }}"
+          feed_category = "{{ fromJson(taskrun.value).category }}"
+
+          result = [{
+            "title": item.get("title"),
+            "link": item.get("link"),
+            "description": item.get("description"),
+            "duration": item.get("itunes:duration"),
+            "duration_seconds": parse_duration(item.get("itunes:duration")),
+            "creator": extract_creator(item),
+            "pubDate": item.get("pubDate"),
+            "pub_date": parse_pub_date(item.get("pubDate")),
+            "guid": extract_guid(item.get("guid")),
+            "audio_url": extract_audio_url(item),
+            "source": source,
+            "episode_number": item.get("itunes:episode"),
+            "season_number": item.get("itunes:season"),
+            "category": item.get("itunes:category") or feed_category,
+            "keywords": item.get("itunes:keywords"),
+            "description_word_count": word_count(item.get("description")),
+            "audio_file_size_bytes": parse_file_size(item),
+            "explicit": parse_explicit(item.get("itunes:explicit")),
+            "image_url": (item.get("itunes:image") or {}).get("@href"),
+          } for item in items]
+
+          fields = [
+            "guid","title","link","description","duration","duration_seconds",
+            "creator","pubDate","pub_date","audio_url","source","episode_number",
+            "season_number","category","keywords","description_word_count",
+            "audio_file_size_bytes","explicit","image_url"
+          ]
+          with open('podcast_data.csv','w',newline='',encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fields, quoting=csv.QUOTE_MINIMAL)
+            cleaned = [r for r in result if r["guid"] and r["title"]]
+            w.writeheader()
+            w.writerows(cleaned)
+          print(f"Feed: {source} | Extracted: {len(result)} | Valid: {len(cleaned)}")
+
+      - id: create_staging_table
+        type: io.kestra.plugin.jdbc.postgresql.Queries
+        sql: |
+          CREATE TABLE IF NOT EXISTS podcast_staging (
+            guid TEXT, title TEXT, link TEXT, description TEXT,
+            duration TEXT, duration_seconds INTEGER, creator TEXT,
+            pubDate TEXT, pub_date TIMESTAMP, audio_url TEXT,
+            source TEXT, episode_number INTEGER, season_number INTEGER,
+            category TEXT, keywords TEXT, description_word_count INTEGER,
+            audio_file_size_bytes BIGINT, explicit BOOLEAN, image_url TEXT
+          );
+          TRUNCATE TABLE podcast_staging;
+
+      - id: load_staging_table
+        type: io.kestra.plugin.jdbc.postgresql.CopyIn
+        format: CSV
+        from: "{{ outputs.extract_podcasts[taskrun.value].outputFiles['podcast_data.csv'] }}"
+        table: podcast_staging
+        columns:
+          - guid
+          - title
+          - link
+          - description
+          - duration
+          - duration_seconds
+          - creator
+          - pubDate
+          - pub_date
+          - audio_url
+          - source
+          - episode_number
+          - season_number
+          - category
+          - keywords
+          - description_word_count
+          - audio_file_size_bytes
+          - explicit
+          - image_url
+
+      - id: store_podcast_metadata
+        type: io.kestra.plugin.jdbc.postgresql.Queries
+        sql: |
+          MERGE INTO podcast_metadata AS PM
+          USING podcast_staging AS PS ON PM.guid = PS.guid
+          WHEN NOT MATCHED THEN
+            INSERT (guid,title,link,description,duration,duration_seconds,
+                    creator,pubDate,pub_date,audio_url,source,
+                    episode_number,season_number,category,keywords,
+                    description_word_count,audio_file_size_bytes,explicit,image_url)
+            VALUES (PS.guid,PS.title,PS.link,PS.description,PS.duration,PS.duration_seconds,
+                    PS.creator,PS.pubDate,PS.pub_date,PS.audio_url,PS.source,
+                    PS.episode_number,PS.season_number,PS.category,PS.keywords,
+                    PS.description_word_count,PS.audio_file_size_bytes,PS.explicit,PS.image_url);
+
+      - id: update_feed_timestamp
+        type: io.kestra.plugin.jdbc.postgresql.Queries
+        sql: |
+          UPDATE podcast_feeds SET last_fetched_at = NOW()
+          WHERE rss_url = '{{ fromJson(taskrun.value).rss_url }}';
+
+  - id: update_log
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
+      UPDATE pipeline_run_log SET
+        finished_at = NOW(), status = 'success',
+        feeds_processed = (SELECT COUNT(DISTINCT source) FROM podcast_metadata
+          WHERE created_at >= (SELECT started_at FROM pipeline_run_log WHERE run_id = '{{ execution.id }}')),
+        episodes_inserted = (SELECT COUNT(*) FROM podcast_metadata
+          WHERE created_at >= (SELECT started_at FROM pipeline_run_log WHERE run_id = '{{ execution.id }}'))
+      WHERE run_id = '{{ execution.id }}';
+
+  - id: purge_files
+    type: io.kestra.plugin.core.storage.PurgeCurrentExecutionFiles
+
+errors:
+  - id: log_failure
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
+      UPDATE pipeline_run_log SET finished_at = NOW(), status = 'failed',
+        error_message = '{{ execution.id }} failed'
+      WHERE run_id = '{{ execution.id }}';
+
+pluginDefaults:
+  - type: io.kestra.plugin.jdbc.postgresql
+    values:
+      url: jdbc:postgresql://{{ secret('DB_HOST') }}:{{ secret('DB_PORT') }}/{{ secret('DB_NAME') }}
+      username: "{{ secret('DB_USER') }}"
+      password: "{{ secret('DB_PASSWORD') }}"
+
+triggers:
+  - id: hourly_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 * * * *"

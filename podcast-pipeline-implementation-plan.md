@@ -550,16 +550,16 @@ Add them to a `podcast_feeds` table in Stage 1.
 
 ### Tasks
 
-- [ ] 📝 Add a `README.md` to the project root explaining what the project does, how to run it locally (prerequisites, `.env` setup, `docker compose up`), and what each service is for. Include a screenshot of the dashboard.
-- [ ] 📝 Add retry logic to the audio download task — wrap the `requests.get` call in a loop with `max_retries = 3` and a 2-second sleep between retries. This alone will dramatically improve download success rates.
-- [ ] 📝 Add a timeout to all HTTP calls (`requests.get(..., timeout=30)`) — the current code has `timeout=60` for audio files, but the RSS fetch itself has no timeout. A single hanging feed can stall the whole pipeline.
-- [ ] 🔄 Split the main flow into two separate flows:
+- [x] 📝 Add a `README.md` to the project root explaining what the project does, how to run it locally (prerequisites, `.env` setup, `docker compose up`), and what each service is for. Include a screenshot of the dashboard.
+- [x] 📝 Add retry logic to the audio download task — wrap the `requests.get` call in a loop with `max_retries = 3` and a 2-second sleep between retries. This alone will dramatically improve download success rates.
+- [x] 📝 Add a timeout to all HTTP calls (`requests.get(..., timeout=30)`) — the current code has `timeout=60` for audio files, but the RSS fetch itself has no timeout. A single hanging feed can stall the whole pipeline.
+- [x] 🔄 Split the main flow into two separate flows:
   - `ingest-metadata.yaml` — RSS fetch → extract → store metadata only (runs every hour)
   - `download-audio.yaml` — reads undownloaded episodes from DB → downloads audio (runs every 6 hours, heavier task)
   This separation means metadata is always fresh even if audio downloads are slow.
-- [ ] 📝 In `dashboard/requirements.txt`, pin all dependency versions (they already are — keep them pinned and update them deliberately, not automatically).
-- [ ] 📝 Add a `.dockerignore` file in `dashboard/` that excludes `.env`, `.git`, `__pycache__`, and `*.pyc` from the Docker build context.
-- [ ] 🧪 Do a clean end-to-end test: `docker compose down -v` (removes all volumes and data), then `docker compose up`, run `init-schema`, run `seed-feeds`, run the pipeline, open the dashboard. Everything should work from scratch.
+- [x] 📝 In `dashboard/requirements.txt`, pin all dependency versions (they already are — keep them pinned and update them deliberately, not automatically).
+- [x] 📝 Add a `.dockerignore` file in `dashboard/` that excludes `.env`, `.git`, `__pycache__`, and `*.pyc` from the Docker build context.
+- [ ] 🧪 Do a clean end-to-end test: `docker compose down -v` (removes all volumes and data), then `docker compose up`, run `init-schema`, run `seed-feeds`, run the pipeline, open the dashboard. Everything should work from scratch. *(Manual verification required)*
 
 ---
 

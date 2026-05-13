@@ -4,7 +4,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 from sqlalchemy import create_engine, text
 import os
+import logging
 from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────
 # Page Config
@@ -104,6 +107,11 @@ PLOTLY_LAYOUT = dict(
 # ─────────────────────────────────────────────────────────
 # DB Connection
 # ─────────────────────────────────────────────────────────
+REQUIRED_TABLES = ['podcast_feeds', 'podcast_metadata', 'podcast_downloads', 'pipeline_run_log']
+REQUIRED_VIEWS  = ['v_episodes_clean', 'v_feed_stats', 'v_publishing_heatmap',
+                   'v_weekly_volume', 'v_download_health', 'v_data_quality']
+
+
 @st.cache_resource
 def get_db_engine():
     db_user = os.environ.get('DB_USER', 'postgres')
@@ -115,6 +123,25 @@ def get_db_engine():
     return create_engine(conn_str)
 
 
+@st.cache_data(ttl=300)
+def check_schema_health():
+    """Return (missing_tables, missing_views, db_reachable)."""
+    engine = get_db_engine()
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_type IN ('BASE TABLE', 'VIEW')"
+            ))
+            existing = {row[0] for row in result}
+        missing_tables = [t for t in REQUIRED_TABLES if t not in existing]
+        missing_views  = [v for v in REQUIRED_VIEWS  if v not in existing]
+        return missing_tables, missing_views, True
+    except Exception as e:
+        logger.error("Database connection failed: %s", e)
+        return REQUIRED_TABLES, REQUIRED_VIEWS, False
+
+
 @st.cache_data(ttl=60)
 def load_data(query, params=None):
     engine = get_db_engine()
@@ -123,7 +150,22 @@ def load_data(query, params=None):
             df = pd.read_sql(text(query), conn, params=params or {})
         return df
     except Exception as e:
+        logger.warning("Query failed: %s — %s", e, query[:120])
         return pd.DataFrame()
+
+
+def build_cat_filter(selected_categories, category_list, params, col="category"):
+    """Build a parameterized IN clause for category filtering.
+    Mutates `params` dict in-place, returns SQL fragment string.
+    """
+    if not selected_categories or len(selected_categories) >= len(category_list):
+        return ""
+    placeholders = []
+    for i, cat in enumerate(selected_categories):
+        key = f"cat_{i}"
+        placeholders.append(f":{key}")
+        params[key] = cat
+    return f"AND {col} IN ({', '.join(placeholders)})"
 
 
 def safe_metric(label, value, fmt=None):
@@ -135,6 +177,38 @@ def safe_metric(label, value, fmt=None):
     else:
         st.metric(label, value)
 
+
+# ─────────────────────────────────────────────────────────
+# Schema Health Check
+# ─────────────────────────────────────────────────────────
+missing_tables, missing_views, db_reachable = check_schema_health()
+schema_ok = db_reachable and not missing_tables and not missing_views
+
+if not db_reachable:
+    st.error(
+        "🚨 **Cannot connect to the database.**\n\n"
+        "Make sure the `pgdatabase` service is running:\n"
+        "```bash\ndocker compose up pgdatabase -d\n```"
+    )
+    st.stop()
+
+if not schema_ok:
+    all_missing = missing_tables + missing_views
+    st.warning(
+        "⚠️ **Database schema is not initialized** — the following "
+        f"{len(all_missing)} relation(s) are missing:\n\n"
+        + ", ".join(f"`{m}`" for m in all_missing)
+        + "\n\n**How to fix:** Run the `init-schema` flow in Kestra "
+        "(namespace `deeptech`) or execute the SQL from "
+        "`flows/init-schema.yaml` directly against the database.\n\n"
+        "```bash\n"
+        "# Via Kestra UI → deeptech / init-schema → Execute\n"
+        "# Or manually:\n"
+        "docker compose exec pgdatabase psql -U $DB_USER -d $DB_NAME -f /path/to/schema.sql\n"
+        "```"
+    )
+    st.info("📊 Dashboard will display data once the schema is created and the pipeline has run.")
+    st.stop()
 
 # ─────────────────────────────────────────────────────────
 # Sidebar — global filters (Stage 4f)
@@ -159,13 +233,10 @@ else:
     start_date = default_start.date()
     end_date = datetime.now().date()
 
-# Build WHERE clause fragments for filters
-cat_filter = ""
-if selected_categories and len(selected_categories) < len(category_list):
-    cats = ", ".join(f"'{c}'" for c in selected_categories)
-    cat_filter = f"AND category IN ({cats})"
-
-date_filter = f"AND pub_date >= '{start_date}' AND pub_date <= '{end_date}'"
+# Build parameterized filter values (used by each query individually)
+# Each query call site builds its own params dict and calls build_cat_filter()
+filter_start_date = str(start_date)
+filter_end_date = str(end_date)
 
 if st.sidebar.button("🔄 Refresh Data"):
     st.cache_data.clear()
@@ -192,10 +263,13 @@ with tab1:
     # KPI metrics row
     col1, col2, col3, col4, col5 = st.columns(5)
 
-    total_eps = load_data(f"SELECT COUNT(*) as c FROM podcast_metadata WHERE 1=1 {cat_filter}")
+    p1 = {}; cf1 = build_cat_filter(selected_categories, category_list, p1)
+    total_eps = load_data(f"SELECT COUNT(*) as c FROM podcast_metadata WHERE 1=1 {cf1}", p1)
     total_feeds = load_data("SELECT COUNT(*) as c FROM podcast_feeds WHERE is_active = TRUE")
-    total_hours = load_data(f"SELECT COALESCE(SUM(duration_seconds) / 3600.0, 0) as c FROM podcast_metadata WHERE duration_seconds IS NOT NULL {cat_filter}")
-    recent_eps = load_data(f"SELECT COUNT(*) as c FROM podcast_metadata WHERE created_at >= NOW() - INTERVAL '7 days' {cat_filter}")
+    p2 = {}; cf2 = build_cat_filter(selected_categories, category_list, p2)
+    total_hours = load_data(f"SELECT COALESCE(SUM(duration_seconds) / 3600.0, 0) as c FROM podcast_metadata WHERE duration_seconds IS NOT NULL {cf2}", p2)
+    p3 = {}; cf3 = build_cat_filter(selected_categories, category_list, p3)
+    recent_eps = load_data(f"SELECT COUNT(*) as c FROM podcast_metadata WHERE created_at >= NOW() - INTERVAL '7 days' {cf3}", p3)
     dl_rate = load_data("SELECT ROUND(100.0 * SUM(CASE WHEN status IN ('success','skipped') THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) as c FROM podcast_downloads")
 
     with col1:
@@ -220,11 +294,12 @@ with tab1:
 
     with row1_col1:
         st.subheader("Top 15 Shows by Episode Count")
+        p_top = {}; cf_top = build_cat_filter(selected_categories, category_list, p_top)
         df = load_data(f"""
             SELECT source, COUNT(*) AS total_episodes
-            FROM podcast_metadata WHERE 1=1 {cat_filter}
+            FROM podcast_metadata WHERE 1=1 {cf_top}
             GROUP BY source ORDER BY 2 DESC LIMIT 15
-        """)
+        """, p_top)
         if not df.empty:
             fig = px.bar(df, y='source', x='total_episodes', orientation='h',
                          color='total_episodes',
@@ -237,11 +312,12 @@ with tab1:
 
     with row1_col2:
         st.subheader("Episodes by Category")
+        p_pie = {}; cf_pie = build_cat_filter(selected_categories, category_list, p_pie)
         df = load_data(f"""
             SELECT category, COUNT(*) AS total
-            FROM podcast_metadata WHERE category IS NOT NULL {cat_filter}
+            FROM podcast_metadata WHERE category IS NOT NULL {cf_pie}
             GROUP BY category ORDER BY 2 DESC
-        """)
+        """, p_pie)
         if not df.empty:
             fig = px.pie(df, names='category', values='total', hole=0.45,
                          color_discrete_sequence=CATEGORY_COLORS)
@@ -251,12 +327,13 @@ with tab1:
             st.info("No data available.")
 
     st.subheader("Average Episode Duration by Category")
+    p_dur = {}; cf_dur = build_cat_filter(selected_categories, category_list, p_dur)
     df = load_data(f"""
         SELECT category, ROUND(AVG(duration_seconds) / 60.0, 1) AS avg_minutes
         FROM podcast_metadata
-        WHERE duration_seconds IS NOT NULL AND category IS NOT NULL {cat_filter}
+        WHERE duration_seconds IS NOT NULL AND category IS NOT NULL {cf_dur}
         GROUP BY category ORDER BY 2 DESC
-    """)
+    """, p_dur)
     if not df.empty:
         fig = px.bar(df, x='category', y='avg_minutes',
                      color='avg_minutes',
@@ -407,13 +484,14 @@ with tab3:
 
     with trend_col2:
         st.subheader("Duration vs. Description Length")
+        p_sc = {}; cf_sc = build_cat_filter(selected_categories, category_list, p_sc)
         scatter_df = load_data(f"""
             SELECT duration_minutes, description_word_count, category, title
             FROM v_episodes_clean
             WHERE duration_minutes IS NOT NULL AND description_word_count IS NOT NULL
-                  AND description_word_count > 0 {cat_filter}
+                  AND description_word_count > 0 {cf_sc}
             LIMIT 2000
-        """)
+        """, p_sc)
         if not scatter_df.empty:
             fig = px.scatter(scatter_df, x='description_word_count', y='duration_minutes',
                              color='category', hover_data=['title'],
@@ -427,12 +505,13 @@ with tab3:
             st.info("No data available yet.")
 
     st.subheader("Average Episode Duration Trend")
+    p_dt = {}; cf_dt = build_cat_filter(selected_categories, category_list, p_dt)
     dur_trend = load_data(f"""
         SELECT pub_week, ROUND(AVG(duration_minutes), 1) AS avg_duration
         FROM v_episodes_clean
-        WHERE duration_minutes IS NOT NULL AND pub_week IS NOT NULL {cat_filter}
+        WHERE duration_minutes IS NOT NULL AND pub_week IS NOT NULL {cf_dt}
         GROUP BY pub_week ORDER BY pub_week
-    """)
+    """, p_dt)
     if not dur_trend.empty:
         fig = px.line(dur_trend, x='pub_week', y='avg_duration', markers=True,
                       labels={'pub_week': 'Week', 'avg_duration': 'Avg Duration (min)'},

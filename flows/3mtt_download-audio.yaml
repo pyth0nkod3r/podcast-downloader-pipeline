@@ -1,0 +1,172 @@
+id: 3mtt_download-audio
+namespace: deeptech
+description: |
+  Audio download pipeline: reads episodes with audio URLs that haven't
+  been downloaded yet, downloads the MP3 files with retry logic, and
+  records results in podcast_downloads. Runs every 6 hours.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+tasks:
+
+  - id: start_log
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
+      INSERT INTO pipeline_run_log (run_id, flow_id, started_at, status)
+      VALUES ('{{ execution.id }}', 'download-audio', NOW(), 'running')
+      ON CONFLICT (run_id) DO NOTHING;
+
+  - id: fetch_pending_episodes
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Find episodes that have an audio URL but no download record yet.
+    sql: |
+      SELECT m.guid, m.audio_url, m.title
+      FROM podcast_metadata m
+      LEFT JOIN podcast_downloads d ON m.guid = d.guid
+      WHERE m.audio_url IS NOT NULL
+        AND (d.guid IS NULL OR d.status = 'failed')
+      ORDER BY m.created_at DESC
+      LIMIT 500
+    fetchType: STORE
+
+  - id: download_audio
+    type: io.kestra.plugin.scripts.python.Script
+    inputFiles:
+      pending.ion: "{{ outputs.fetch_pending_episodes.uri }}"
+    outputFiles:
+      - download_results.csv
+    script: |
+      import json, os, re, time, csv
+      import requests
+
+      AUDIO_DIR = "/app/storage/audio"
+      os.makedirs(AUDIO_DIR, exist_ok=True)
+      MAX_RETRIES = 3
+
+      def sanitize(title):
+        safe = re.sub(r'[^\w\s-]', '', title or 'unknown')
+        safe = re.sub(r'[\s_]+', '_', safe).strip('_')
+        return safe[:100]
+
+      # Read ION-format rows from Kestra STORE output
+      items = []
+      try:
+        import amazon.ion.simpleion as ion
+        with open("pending.ion", "rb") as f:
+          for val in ion.load(f, single_value=False):
+            items.append(dict(val))
+      except ImportError:
+        # Fallback: parse line-delimited ION as text
+        with open("pending.ion", "r", encoding="utf-8") as f:
+          for line in f:
+            line = line.strip()
+            if line:
+              try:
+                row = json.loads(line.replace("'", '"'))
+                items.append(row)
+              except:
+                pass
+
+      print(f"Episodes to download: {len(items)}")
+      results = []
+
+      for item in items:
+        guid = str(item.get("guid",""))
+        url = str(item.get("audio_url",""))
+        title = str(item.get("title", guid))
+        filename = sanitize(title) + ".mp3"
+        filepath = os.path.join(AUDIO_DIR, filename)
+
+        if os.path.exists(filepath):
+          results.append({"guid": guid, "file_path": filepath, "status": "skipped"})
+          continue
+
+        success = False
+        for attempt in range(1, MAX_RETRIES + 1):
+          try:
+            resp = requests.get(url, stream=True, timeout=60)
+            resp.raise_for_status()
+            with open(filepath, "wb") as af:
+              for chunk in resp.iter_content(chunk_size=8192):
+                af.write(chunk)
+            results.append({"guid": guid, "file_path": filepath, "status": "success"})
+            success = True
+            break
+          except Exception as e:
+            print(f"[RETRY {attempt}/{MAX_RETRIES}] {filename}: {e}")
+            if attempt < MAX_RETRIES:
+              time.sleep(2)
+
+        if not success:
+          results.append({"guid": guid, "file_path": "", "status": "failed"})
+
+      with open("download_results.csv", "w", newline="", encoding="utf-8") as rf:
+        w = csv.DictWriter(rf, fieldnames=["guid","file_path","status"])
+        w.writeheader()
+        w.writerows(results)
+
+      ok = sum(1 for r in results if r["status"]=="success")
+      skip = sum(1 for r in results if r["status"]=="skipped")
+      fail = sum(1 for r in results if r["status"]=="failed")
+      print(f"=== AUDIO DOWNLOAD SUMMARY ===")
+      print(f"Downloaded: {ok} | Skipped: {skip} | Failed: {fail}")
+
+  - id: create_downloads_staging
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
+      DROP TABLE IF EXISTS podcast_downloads_staging;
+      CREATE TABLE podcast_downloads_staging (
+        guid TEXT, file_path TEXT, status TEXT
+      );
+
+  - id: load_downloads_staging
+    type: io.kestra.plugin.jdbc.postgresql.CopyIn
+    format: CSV
+    from: "{{ outputs.download_audio.outputFiles['download_results.csv'] }}"
+    table: podcast_downloads_staging
+    columns: [guid, file_path, status]
+
+  - id: merge_downloads
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
+      MERGE INTO podcast_downloads AS PD
+      USING podcast_downloads_staging AS PDS ON PD.guid = PDS.guid
+      WHEN MATCHED THEN
+        UPDATE SET file_path = PDS.file_path, status = PDS.status, downloaded_at = NOW()
+      WHEN NOT MATCHED THEN
+        INSERT (guid, file_path, status, downloaded_at)
+        VALUES (PDS.guid, PDS.file_path, PDS.status, NOW());
+
+  - id: update_log
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
+      UPDATE pipeline_run_log SET
+        finished_at = NOW(), status = 'success',
+        download_success = (SELECT COUNT(*) FROM podcast_downloads_staging WHERE status = 'success'),
+        download_failed = (SELECT COUNT(*) FROM podcast_downloads_staging WHERE status = 'failed')
+      WHERE run_id = '{{ execution.id }}';
+
+  - id: purge_files
+    type: io.kestra.plugin.core.storage.PurgeCurrentExecutionFiles
+
+errors:
+  - id: log_failure
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    sql: |
+      UPDATE pipeline_run_log SET finished_at = NOW(), status = 'failed',
+        error_message = '{{ execution.id }} failed'
+      WHERE run_id = '{{ execution.id }}';
+
+pluginDefaults:
+  - type: io.kestra.plugin.jdbc.postgresql
+    values:
+      url: jdbc:postgresql://{{ secret('DB_HOST') }}:{{ secret('DB_PORT') }}/{{ secret('DB_NAME') }}
+      username: "{{ secret('DB_USER') }}"
+      password: "{{ secret('DB_PASSWORD') }}"
+
+triggers:
+  - id: six_hourly_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 */6 * * *"
