@@ -254,7 +254,7 @@ st.markdown("Real-time observability into the automated podcast ingestion workfl
 # ─────────────────────────────────────────────────────────
 # Tabs (Stage 4a)
 # ─────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "🎙️ Shows", "📅 Trends", "🔧 Pipeline Health"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "🎙️ Shows", "📅 Trends", "🔧 Pipeline Health", "⚠️ Feed Health"])
 
 # ═══════════════════════════════════════════════════════════
 # TAB 1 — OVERVIEW
@@ -628,3 +628,142 @@ with tab4:
                      })
     else:
         st.info("No downloads recorded yet.")
+
+
+# ═══════════════════════════════════════════════════════════
+# TAB 5 — FEED HEALTH (Failed Feeds)
+# ═══════════════════════════════════════════════════════════
+with tab5:
+    st.subheader("Feed Fetch Failures")
+    st.markdown(
+        "Monitor feed availability and automatically disabled feeds. "
+        "Feeds with 5+ failures in 7 days are automatically marked inactive."
+    )
+
+    # Summary stats
+    summary_col1, summary_col2, summary_col3 = st.columns(3)
+
+    # Total failures (last 7 days)
+    failures_7d = load_data(
+        "SELECT COUNT(*) as count FROM feed_fetch_failures "
+        "WHERE error_timestamp >= NOW() - INTERVAL '7 days'"
+    )
+    with summary_col1:
+        val = failures_7d['count'].iloc[0] if not failures_7d.empty else 0
+        safe_metric("Failures (7 Days)", f"{val:,}")
+
+    # Feeds currently inactive due to failures
+    inactive_feeds = load_data(
+        "SELECT COUNT(*) as count FROM podcast_feeds WHERE is_active = FALSE"
+    )
+    with summary_col2:
+        val = inactive_feeds['count'].iloc[0] if not inactive_feeds.empty else 0
+        safe_metric("Inactive Feeds", val)
+
+    # Unique feeds with failures
+    failing_feeds = load_data(
+        "SELECT COUNT(DISTINCT feed_id) as count FROM feed_fetch_failures "
+        "WHERE error_timestamp >= NOW() - INTERVAL '7 days'"
+    )
+    with summary_col3:
+        val = failing_feeds['count'].iloc[0] if not failing_feeds.empty else 0
+        safe_metric("Feeds with Failures", val)
+
+    st.markdown("---")
+
+    # Failure trend
+    st.subheader("Failure Trend (Last 30 Days)")
+    failure_trend = load_data("""
+        SELECT DATE(error_timestamp) as date, COUNT(*) as failure_count
+        FROM feed_fetch_failures
+        WHERE error_timestamp >= NOW() - INTERVAL '30 days'
+        GROUP BY DATE(error_timestamp)
+        ORDER BY date
+    """)
+    if not failure_trend.empty:
+        fig = px.bar(failure_trend, x='date', y='failure_count',
+                     color='failure_count',
+                     color_continuous_scale=['#EF553B', '#FFA15A'],
+                     labels={'date': 'Date', 'failure_count': 'Failure Count'})
+        fig.update_layout(**PLOTLY_LAYOUT, showlegend=False, coloraxis_showscale=False)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No failures recorded in the last 30 days.")
+
+    st.markdown("---")
+
+    # Top failing feeds
+    st.subheader("Top 10 Feeds by Failure Count (Last 7 Days)")
+    top_failures = load_data("""
+        SELECT feed_name, feed_id, rss_url, COUNT(*) as failure_count,
+               MIN(error_timestamp) as first_failure,
+               MAX(error_timestamp) as last_failure,
+               COUNT(DISTINCT error_type) as error_types
+        FROM feed_fetch_failures
+        WHERE error_timestamp >= NOW() - INTERVAL '7 days'
+        GROUP BY feed_id, feed_name, rss_url
+        ORDER BY failure_count DESC
+        LIMIT 10
+    """)
+    if not top_failures.empty:
+        st.dataframe(top_failures, use_container_width=True, hide_index=True,
+                     column_config={
+                         "feed_name": "Feed Name",
+                         "feed_id": "Feed ID",
+                         "rss_url": "RSS URL",
+                         "failure_count": st.column_config.NumberColumn("Failures", format="%d"),
+                         "first_failure": st.column_config.DatetimeColumn("First Failure", format="YYYY-MM-DD HH:mm"),
+                         "last_failure": st.column_config.DatetimeColumn("Last Failure", format="YYYY-MM-DD HH:mm"),
+                         "error_types": "Error Types",
+                     })
+    else:
+        st.info("No feed failures in the last 7 days. Great job! 🎉")
+
+    st.markdown("---")
+
+    # Recent failures (last 100)
+    st.subheader("Recent Failures (Last 100)")
+    recent_failures = load_data("""
+        SELECT feed_name, rss_url, error_timestamp, error_type
+        FROM feed_fetch_failures
+        ORDER BY error_timestamp DESC
+        LIMIT 100
+    """)
+    if not recent_failures.empty:
+        st.dataframe(recent_failures, use_container_width=True, hide_index=True,
+                     column_config={
+                         "feed_name": "Feed Name",
+                         "rss_url": "RSS URL",
+                         "error_timestamp": st.column_config.DatetimeColumn("Error Time", format="YYYY-MM-DD HH:mm:ss"),
+                         "error_type": "Error Type",
+                     })
+    else:
+        st.info("No recent failures recorded.")
+
+    st.markdown("---")
+
+    # Inactive feeds (can be re-enabled)
+    st.subheader("Inactive Feeds")
+    inactive_df = load_data("""
+        SELECT feed_id, feed_name, rss_url, is_active, updated_at
+        FROM podcast_feeds
+        WHERE is_active = FALSE
+        ORDER BY updated_at DESC
+    """)
+    if not inactive_df.empty:
+        st.info(
+            f"📌 {len(inactive_df)} feed(s) are currently inactive. "
+            "These were automatically disabled after multiple consecutive failures. "
+            "You can re-enable them manually in the database once the underlying issue is fixed."
+        )
+        st.dataframe(inactive_df, use_container_width=True, hide_index=True,
+                     column_config={
+                         "feed_id": "Feed ID",
+                         "feed_name": "Feed Name",
+                         "rss_url": "RSS URL",
+                         "is_active": "Active",
+                         "updated_at": st.column_config.DatetimeColumn("Updated", format="YYYY-MM-DD HH:mm"),
+                     })
+    else:
+        st.success("✅ All feeds are active!")
+
