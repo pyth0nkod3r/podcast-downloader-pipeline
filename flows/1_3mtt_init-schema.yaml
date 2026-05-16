@@ -1,0 +1,416 @@
+id: 1_3mtt_init-schema
+namespace: deeptech
+description: |
+  Creates all database tables and views for the podcast pipeline.
+  Run this once manually before the first pipeline run.
+  Safe to re-run — all statements use IF NOT EXISTS / CREATE OR REPLACE.
+
+tasks:
+
+  # ===== Core Tables =====
+
+  - id: create_podcast_feeds
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Feed catalog — the source of truth for which RSS feeds to process.
+    sql: |
+      CREATE TABLE IF NOT EXISTS podcast_feeds (
+        feed_id         SERIAL PRIMARY KEY,
+        feed_name       TEXT NOT NULL,
+        rss_url         TEXT NOT NULL UNIQUE,
+        category        TEXT,
+        is_active       BOOLEAN DEFAULT TRUE,
+        added_at        TIMESTAMP DEFAULT NOW(),
+        updated_at      TIMESTAMP,
+        last_fetched_at TIMESTAMP
+      );
+
+  - id: alter_podcast_feeds
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Backfill feed catalog columns on existing tables.
+    sql: |
+      ALTER TABLE podcast_feeds ADD COLUMN IF NOT EXISTS category        TEXT;
+      ALTER TABLE podcast_feeds ADD COLUMN IF NOT EXISTS is_active       BOOLEAN DEFAULT TRUE;
+      ALTER TABLE podcast_feeds ADD COLUMN IF NOT EXISTS added_at        TIMESTAMP DEFAULT NOW();
+      ALTER TABLE podcast_feeds ADD COLUMN IF NOT EXISTS updated_at      TIMESTAMP;
+      ALTER TABLE podcast_feeds ADD COLUMN IF NOT EXISTS last_fetched_at TIMESTAMP;
+
+  - id: create_podcast_metadata
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: One row per episode. The main fact table.
+    sql: |
+      CREATE TABLE IF NOT EXISTS podcast_metadata (
+        guid                    TEXT PRIMARY KEY,
+        title                   TEXT,
+        link                    TEXT,
+        description             TEXT,
+        duration                TEXT,
+        creator                 TEXT,
+        pubDate                 TEXT,
+        audio_url               TEXT,
+        created_at              TIMESTAMP DEFAULT NOW(),
+        source                  TEXT,
+        duration_seconds        INTEGER,
+        pub_date                TIMESTAMP,
+        episode_number          INTEGER,
+        season_number           INTEGER,
+        category                TEXT,
+        keywords                TEXT,
+        description_word_count  INTEGER,
+        audio_file_size_bytes   BIGINT,
+        explicit                BOOLEAN,
+        image_url               TEXT
+      );
+
+  - id: alter_podcast_metadata
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Backfill columns on existing tables (safe if columns already exist).
+    sql: |
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS title                   TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS link                    TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS description             TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS duration                TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS creator                 TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS pubDate                 TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS audio_url               TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS created_at              TIMESTAMP DEFAULT NOW();
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS source                  TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS duration_seconds        INTEGER;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS pub_date                TIMESTAMP;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS episode_number          INTEGER;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS season_number           INTEGER;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS category                TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS keywords                TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS description_word_count  INTEGER;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS audio_file_size_bytes   BIGINT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS explicit                BOOLEAN;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS image_url               TEXT;
+
+  - id: create_pipeline_run_log
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Logs each pipeline execution for observability (Stage 5).
+    sql: |
+      CREATE TABLE IF NOT EXISTS pipeline_run_log (
+        run_id              TEXT PRIMARY KEY,
+        flow_id             TEXT,
+        started_at          TIMESTAMP,
+        finished_at         TIMESTAMP,
+        status              TEXT,
+        feeds_processed     INTEGER,
+        episodes_inserted   INTEGER,
+        episodes_skipped    INTEGER,
+        error_message       TEXT
+      );
+
+  - id: create_feed_fetch_failures
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Tracks RSS fetch failures so repeated bad feeds can be disabled.
+    sql: |
+      CREATE TABLE IF NOT EXISTS feed_fetch_failures (
+        feed_id INTEGER,
+        feed_name TEXT,
+        rss_url TEXT,
+        error_timestamp TIMESTAMP DEFAULT NOW(),
+        error_type TEXT,
+        UNIQUE(feed_id, error_timestamp)
+      );
+      ALTER TABLE feed_fetch_failures ALTER COLUMN error_timestamp SET DEFAULT NOW();
+
+  - id: create_feed_fetch_events
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Tracks every feed fetch attempt for reliability reporting.
+    sql: |
+      CREATE TABLE IF NOT EXISTS feed_fetch_events (
+        event_id SERIAL PRIMARY KEY,
+        feed_id INTEGER,
+        feed_name TEXT,
+        rss_url TEXT,
+        event_timestamp TIMESTAMP DEFAULT NOW(),
+        status TEXT,
+        error_type TEXT
+      );
+      ALTER TABLE feed_fetch_events ALTER COLUMN event_timestamp SET DEFAULT NOW();
+
+  # ===== Analytical Views (Stage 3) =====
+
+  - id: create_view_episodes_clean
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Clean, typed version of raw metadata used as base for all other views.
+    sql: |
+      CREATE OR REPLACE VIEW v_episodes_clean AS
+      SELECT
+        guid,
+        title,
+        source,
+        category,
+        creator,
+        pub_date,
+        DATE_TRUNC('day',  pub_date)  AS pub_day,
+        DATE_TRUNC('week', pub_date)  AS pub_week,
+        DATE_TRUNC('month',pub_date)  AS pub_month,
+        EXTRACT(DOW  FROM pub_date)   AS day_of_week,
+        EXTRACT(HOUR FROM pub_date)   AS hour_of_day,
+        duration_seconds,
+        ROUND(duration_seconds / 60.0, 1) AS duration_minutes,
+        description_word_count,
+        explicit,
+        audio_url IS NOT NULL         AS has_audio,
+        audio_file_size_bytes,
+        keywords,
+        image_url,
+        created_at
+      FROM podcast_metadata
+      WHERE pub_date IS NOT NULL;
+
+  - id: create_view_feed_stats
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: One summary row per feed.
+    sql: |
+      CREATE OR REPLACE VIEW v_feed_stats AS
+      SELECT
+        source,
+        category,
+        COUNT(*)                              AS total_episodes,
+        ROUND(AVG(duration_seconds)/60.0, 1)  AS avg_duration_minutes,
+        MAX(pub_date)                         AS latest_episode_date,
+        MIN(pub_date)                         AS oldest_episode_date,
+        ROUND(AVG(description_word_count),0)  AS avg_description_words,
+        SUM(CASE WHEN explicit THEN 1 ELSE 0 END) AS explicit_episode_count,
+        SUM(CASE WHEN has_audio THEN 1 ELSE 0 END) AS episodes_with_audio,
+        NOW() - MAX(pub_date)                 AS days_since_last_episode
+      FROM v_episodes_clean
+      GROUP BY source, category;
+
+  - id: create_view_publishing_heatmap
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Counts by day-of-week and hour for the heatmap chart.
+    sql: |
+      CREATE OR REPLACE VIEW v_publishing_heatmap AS
+      SELECT
+        day_of_week,
+        hour_of_day,
+        COUNT(*) AS episode_count
+      FROM v_episodes_clean
+      GROUP BY day_of_week, hour_of_day;
+
+  - id: create_view_weekly_volume
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Episode counts per week for the trend chart.
+    sql: |
+      CREATE OR REPLACE VIEW v_weekly_volume AS
+      SELECT
+        pub_week,
+        category,
+        COUNT(*) AS episodes_published
+      FROM v_episodes_clean
+      GROUP BY pub_week, category
+      ORDER BY pub_week;
+
+  - id: create_view_category_growth
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Weekly category growth/shrinkage versus the previous week.
+    sql: |
+      CREATE OR REPLACE VIEW v_category_growth AS
+      WITH weekly AS (
+        SELECT
+          pub_week,
+          category,
+          COUNT(*) AS episodes_published
+        FROM v_episodes_clean
+        GROUP BY pub_week, category
+      ),
+      with_previous AS (
+        SELECT
+          pub_week,
+          category,
+          episodes_published,
+          LAG(episodes_published) OVER (
+            PARTITION BY category ORDER BY pub_week
+          ) AS previous_week_episodes
+        FROM weekly
+      )
+      SELECT
+        pub_week,
+        category,
+        episodes_published,
+        previous_week_episodes,
+        episodes_published - COALESCE(previous_week_episodes, 0) AS week_over_week_change,
+        CASE
+          WHEN previous_week_episodes IS NULL OR previous_week_episodes = 0 THEN NULL
+          ELSE ROUND(
+            100.0 * (episodes_published - previous_week_episodes) / previous_week_episodes,
+            1
+          )
+        END AS week_over_week_pct_change
+      FROM with_previous
+      ORDER BY pub_week, category;
+
+  - id: create_view_feed_episode_totals
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Total episodes by feed for bar charts and frequency rankings.
+    sql: |
+      CREATE OR REPLACE VIEW v_feed_episode_totals AS
+      SELECT
+        source,
+        category,
+        COUNT(*) AS total_episodes,
+        COUNT(*) FILTER (WHERE pub_date >= NOW() - INTERVAL '30 days') AS episodes_last_30_days,
+        COUNT(*) FILTER (WHERE pub_date >= NOW() - INTERVAL '90 days') AS episodes_last_90_days,
+        MIN(pub_date) AS first_episode_date,
+        MAX(pub_date) AS latest_episode_date
+      FROM v_episodes_clean
+      GROUP BY source, category
+      ORDER BY total_episodes DESC;
+
+  - id: create_view_feed_publishing_cadence
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Publishing consistency by feed based on gaps between episodes.
+    sql: |
+      CREATE OR REPLACE VIEW v_feed_publishing_cadence AS
+      WITH ordered AS (
+        SELECT
+          source,
+          category,
+          pub_date,
+          LAG(pub_date) OVER (PARTITION BY source ORDER BY pub_date) AS previous_pub_date
+        FROM v_episodes_clean
+      ),
+      gaps AS (
+        SELECT
+          source,
+          category,
+          EXTRACT(EPOCH FROM (pub_date - previous_pub_date)) / 86400.0 AS gap_days
+        FROM ordered
+        WHERE previous_pub_date IS NOT NULL
+      )
+      SELECT
+        source,
+        category,
+        COUNT(*) + 1 AS episode_count,
+        ROUND(AVG(gap_days)::numeric, 2) AS avg_gap_days,
+        ROUND(STDDEV_POP(gap_days)::numeric, 2) AS gap_stddev_days,
+        CASE
+          WHEN AVG(gap_days) = 0 THEN NULL
+          ELSE ROUND((STDDEV_POP(gap_days) / AVG(gap_days))::numeric, 3)
+        END AS cadence_variability,
+        RANK() OVER (
+          ORDER BY
+            CASE WHEN AVG(gap_days) = 0 THEN NULL ELSE STDDEV_POP(gap_days) / AVG(gap_days) END ASC NULLS LAST,
+            COUNT(*) DESC
+        ) AS consistency_rank
+      FROM gaps
+      GROUP BY source, category
+      HAVING COUNT(*) >= 4
+      ORDER BY consistency_rank;
+
+  - id: create_view_publishing_calendar
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Daily publishing counts for calendar activity charts.
+    sql: |
+      CREATE OR REPLACE VIEW v_publishing_calendar AS
+      SELECT
+        pub_day,
+        category,
+        COUNT(*) AS episodes_published
+      FROM v_episodes_clean
+      GROUP BY pub_day, category
+      ORDER BY pub_day;
+
+  - id: create_view_avg_duration_by_category
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Average episode duration by category for bar charts.
+    sql: |
+      CREATE OR REPLACE VIEW v_avg_duration_by_category AS
+      SELECT
+        category,
+        COUNT(*) FILTER (WHERE duration_seconds IS NOT NULL) AS episodes_with_duration,
+        ROUND(AVG(duration_seconds) / 60.0, 1) AS avg_duration_minutes,
+        ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_seconds) / 60.0)::numeric, 1) AS median_duration_minutes
+      FROM v_episodes_clean
+      WHERE duration_seconds IS NOT NULL
+      GROUP BY category
+      ORDER BY avg_duration_minutes DESC;
+
+  - id: create_view_recent_feed_activity
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Top shows by recent publishing activity.
+    sql: |
+      CREATE OR REPLACE VIEW v_recent_feed_activity AS
+      SELECT
+        source,
+        category,
+        COUNT(*) FILTER (WHERE pub_date >= NOW() - INTERVAL '7 days') AS episodes_last_7_days,
+        COUNT(*) FILTER (WHERE pub_date >= NOW() - INTERVAL '30 days') AS episodes_last_30_days,
+        COUNT(*) FILTER (WHERE pub_date >= NOW() - INTERVAL '90 days') AS episodes_last_90_days,
+        MAX(pub_date) AS latest_episode_date
+      FROM v_episodes_clean
+      GROUP BY source, category
+      ORDER BY episodes_last_30_days DESC, latest_episode_date DESC;
+
+  - id: create_view_feed_reliability
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Feed reliability table with success/failure counts.
+    sql: |
+      CREATE OR REPLACE VIEW v_feed_reliability AS
+      WITH events AS (
+        SELECT feed_id, feed_name, rss_url, event_timestamp, status, error_type
+        FROM feed_fetch_events
+        UNION ALL
+        SELECT feed_id, feed_name, rss_url, error_timestamp, 'failure' AS status, error_type
+        FROM feed_fetch_failures
+        WHERE error_timestamp < COALESCE(
+          (SELECT MIN(event_timestamp) FROM feed_fetch_events),
+          'infinity'::timestamp
+        )
+      )
+      SELECT
+        pf.feed_id,
+        pf.feed_name,
+        pf.category,
+        pf.rss_url,
+        pf.is_active,
+        pf.last_fetched_at,
+        COUNT(e.status) AS fetch_attempts,
+        COUNT(*) FILTER (WHERE e.status = 'success') AS success_count,
+        COUNT(*) FILTER (WHERE e.status = 'failure') AS failure_count,
+        COUNT(*) FILTER (
+          WHERE e.status = 'success'
+            AND e.event_timestamp >= NOW() - INTERVAL '30 days'
+        ) AS success_count_last_30_days,
+        COUNT(*) FILTER (
+          WHERE e.status = 'failure'
+            AND e.event_timestamp >= NOW() - INTERVAL '30 days'
+        ) AS failure_count_last_30_days,
+        CASE
+          WHEN COUNT(e.status) = 0 THEN NULL
+          ELSE ROUND(100.0 * COUNT(*) FILTER (WHERE e.status = 'success') / COUNT(e.status), 1)
+        END AS success_rate_pct,
+        MAX(e.event_timestamp) AS latest_fetch_attempt_at,
+        (ARRAY_AGG(e.error_type ORDER BY e.event_timestamp DESC) FILTER (WHERE e.status = 'failure'))[1] AS latest_error_type
+      FROM podcast_feeds pf
+      LEFT JOIN events e ON e.feed_id = pf.feed_id
+      GROUP BY pf.feed_id, pf.feed_name, pf.category, pf.rss_url, pf.is_active, pf.last_fetched_at
+      ORDER BY failure_count_last_30_days DESC, success_rate_pct ASC NULLS LAST, pf.feed_name;
+
+  - id: create_view_data_quality
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: One row per feed showing metadata completeness percentages.
+    sql: |
+      CREATE OR REPLACE VIEW v_data_quality AS
+      SELECT
+        source,
+        COUNT(*)                                                                       AS total,
+        ROUND(100.0 * SUM(CASE WHEN title IS NOT NULL THEN 1 ELSE 0 END)           / COUNT(*), 1) AS pct_has_title,
+        ROUND(100.0 * SUM(CASE WHEN audio_url IS NOT NULL THEN 1 ELSE 0 END)       / COUNT(*), 1) AS pct_has_audio_url,
+        ROUND(100.0 * SUM(CASE WHEN duration_seconds IS NOT NULL THEN 1 ELSE 0 END)/ COUNT(*), 1) AS pct_has_duration,
+        ROUND(100.0 * SUM(CASE WHEN pub_date IS NOT NULL THEN 1 ELSE 0 END)        / COUNT(*), 1) AS pct_has_pub_date,
+        ROUND(100.0 * SUM(CASE WHEN category IS NOT NULL THEN 1 ELSE 0 END)        / COUNT(*), 1) AS pct_has_category
+      FROM podcast_metadata
+      GROUP BY source
+      ORDER BY total DESC;
+
+pluginDefaults:
+  - type: io.kestra.plugin.jdbc.postgresql
+    values:
+      url: jdbc:postgresql://{{ secret('DB_HOST') }}:{{ secret('DB_PORT') }}/{{ secret('DB_NAME') }}
+      username: "{{ secret('DB_USER') }}"
+      password: "{{ secret('DB_PASSWORD') }}"

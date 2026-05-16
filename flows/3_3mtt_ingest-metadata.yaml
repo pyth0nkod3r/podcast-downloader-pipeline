@@ -1,4 +1,4 @@
-id: 3mtt_ingest-metadata
+id: 3_3mtt_ingest-metadata
 namespace: deeptech
 description: |
   Metadata-only pipeline: fetches RSS feeds from the catalog, extracts
@@ -9,6 +9,78 @@ concurrency:
   behavior: QUEUE
 
 tasks:
+
+  - id: ensure_runtime_schema
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    description: Keep scheduled runs alive if the init schema flow was only partially applied.
+    sql: |
+      CREATE TABLE IF NOT EXISTS pipeline_run_log (
+        run_id              TEXT PRIMARY KEY,
+        flow_id             TEXT,
+        started_at          TIMESTAMP,
+        finished_at         TIMESTAMP,
+        status              TEXT,
+        feeds_processed     INTEGER,
+        episodes_inserted   INTEGER,
+        episodes_skipped    INTEGER,
+        error_message       TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS podcast_feeds (
+        feed_id         SERIAL PRIMARY KEY,
+        feed_name       TEXT NOT NULL,
+        rss_url         TEXT NOT NULL UNIQUE,
+        category        TEXT,
+        is_active       BOOLEAN DEFAULT TRUE,
+        added_at        TIMESTAMP DEFAULT NOW(),
+        updated_at      TIMESTAMP,
+        last_fetched_at TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS podcast_metadata (
+        guid                    TEXT PRIMARY KEY
+      );
+
+      CREATE TABLE IF NOT EXISTS feed_fetch_failures (
+        feed_id INTEGER,
+        feed_name TEXT,
+        rss_url TEXT,
+        error_timestamp TIMESTAMP DEFAULT NOW(),
+        error_type TEXT,
+        UNIQUE(feed_id, error_timestamp)
+      );
+      ALTER TABLE feed_fetch_failures ALTER COLUMN error_timestamp SET DEFAULT NOW();
+
+      CREATE TABLE IF NOT EXISTS feed_fetch_events (
+        event_id SERIAL PRIMARY KEY,
+        feed_id INTEGER,
+        feed_name TEXT,
+        rss_url TEXT,
+        event_timestamp TIMESTAMP DEFAULT NOW(),
+        status TEXT,
+        error_type TEXT
+      );
+      ALTER TABLE feed_fetch_events ALTER COLUMN event_timestamp SET DEFAULT NOW();
+
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS title                   TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS link                    TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS description             TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS duration                TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS creator                 TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS pubDate                 TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS audio_url               TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS created_at              TIMESTAMP DEFAULT NOW();
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS source                  TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS duration_seconds        INTEGER;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS pub_date                TIMESTAMP;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS episode_number          INTEGER;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS season_number           INTEGER;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS category                TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS keywords                TEXT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS description_word_count  INTEGER;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS audio_file_size_bytes   BIGINT;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS explicit                BOOLEAN;
+      ALTER TABLE podcast_metadata ADD COLUMN IF NOT EXISTS image_url               TEXT;
 
   - id: start_log
     type: io.kestra.plugin.jdbc.postgresql.Queries
@@ -27,52 +99,121 @@ tasks:
     fetchType: FETCH
 
   - id: process_feeds
-    type: io.kestra.plugin.core.flow.EachSequential
-    value: "{{ outputs.fetch_active_feeds.rows }}"
+    type: io.kestra.plugin.core.flow.ForEach
+    values: "{{ outputs.fetch_active_feeds.rows }}"
+    concurrencyLimit: 1
     tasks:
 
       - id: rss_fetch
         type: io.kestra.plugin.scripts.python.Script
         outputFiles:
           - rss_content.xml
+          - feed_fetch_failure.csv
+          - feed_fetch_event.csv
         script: |
+          import csv
           import urllib.request
-          import sys
+          import xml.etree.ElementTree as ET
           from pathlib import Path
           
           url = "{{ fromJson(taskrun.value).rss_url }}"
           feed_name = "{{ fromJson(taskrun.value).feed_name }}"
+          feed_id = "{{ fromJson(taskrun.value).feed_id }}"
           
           try:
               req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
               with urllib.request.urlopen(req, timeout=30) as response:
                   content = response.read()
+
+              root = ET.fromstring(content)
+              root_name = root.tag.split('}', 1)[-1].lower()
+              if root_name not in ("rss", "feed"):
+                  raise ValueError(f"Fetched content is not an RSS/Atom feed: root tag is {root_name}")
               
-              # Write to output file
               Path('rss_content.xml').write_bytes(content)
+              with open("feed_fetch_failure.csv", "w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=["feed_id", "feed_name", "rss_url", "error_type"])
+                  w.writeheader()
+              with open("feed_fetch_event.csv", "w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=["feed_id", "feed_name", "rss_url", "status", "error_type"])
+                  w.writeheader()
+                  w.writerow({
+                      "feed_id": feed_id,
+                      "feed_name": feed_name,
+                      "rss_url": url,
+                      "status": "success",
+                      "error_type": "",
+                  })
               print(f"Successfully fetched RSS from {feed_name}")
-              sys.exit(0)
               
           except Exception as e:
+              # Keep the flow moving; the failure is loaded into feed_fetch_failures below.
+              Path('rss_content.xml').write_text(
+                  '<?xml version="1.0" encoding="UTF-8"?><rss><channel></channel></rss>',
+                  encoding="utf-8",
+              )
+              with open("feed_fetch_failure.csv", "w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=["feed_id", "feed_name", "rss_url", "error_type"])
+                  w.writeheader()
+                  w.writerow({
+                      "feed_id": feed_id,
+                      "feed_name": feed_name,
+                      "rss_url": url,
+                      "error_type": str(e)[:500],
+                  })
+              with open("feed_fetch_event.csv", "w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=["feed_id", "feed_name", "rss_url", "status", "error_type"])
+                  w.writeheader()
+                  w.writerow({
+                      "feed_id": feed_id,
+                      "feed_name": feed_name,
+                      "rss_url": url,
+                      "status": "failure",
+                      "error_type": str(e)[:500],
+                  })
               print(f"Failed to fetch {feed_name} from {url}: {str(e)}")
-              sys.exit(1)
+
+      - id: load_feed_fetch_failure
+        type: io.kestra.plugin.jdbc.postgresql.CopyIn
+        format: CSV
+        header: true
+        from: "{{ outputs.rss_fetch[taskrun.value].outputFiles['feed_fetch_failure.csv'] }}"
+        table: feed_fetch_failures
+        columns:
+          - feed_id
+          - feed_name
+          - rss_url
+          - error_type
+
+      - id: load_feed_fetch_event
+        type: io.kestra.plugin.jdbc.postgresql.CopyIn
+        format: CSV
+        header: true
+        from: "{{ outputs.rss_fetch[taskrun.value].outputFiles['feed_fetch_event.csv'] }}"
+        table: feed_fetch_events
+        columns:
+          - feed_id
+          - feed_name
+          - rss_url
+          - status
+          - error_type
 
       - id: check_fetch_success
         type: io.kestra.plugin.core.flow.If
-        condition: "{{ taskrun.state == 'SUCCESS' }}"
+        condition: "{{ true }}"
         then:
           - id: xml_to_ion
             type: io.kestra.plugin.serdes.xml.XmlToIon
-            from: "{{ outputs.rss_fetch[taskrun.value].outputFiles['rss_content.xml'] }}"
+            from: "{{ outputs.rss_fetch[parent.taskrun.value].outputFiles['rss_content.xml'] }}"
 
           - id: ion_to_json
             type: io.kestra.plugin.serdes.json.IonToJson
-            from: "{{ outputs.xml_to_ion[taskrun.value].uri }}"
+            from: "{{ outputs.xml_to_ion[parent.taskrun.value].uri }}"
 
           - id: extract_podcasts
             type: io.kestra.plugin.scripts.python.Script
             inputFiles:
-              json_data.json: "{{ outputs.ion_to_json[taskrun.value].uri }}"
+              json_data.json: "{{ outputs.ion_to_json[parent.taskrun.value].uri }}"
             outputFiles:
               - podcast_data.csv
             script: |
@@ -119,12 +260,17 @@ tasks:
               with open("json_data.json","r",encoding="utf-8") as f:
                 raw = json.load(f)
 
-              channel = raw.get("rss",{}).get("channel",{})
-              items = channel.get("item",[])
+              rss = raw.get("rss", {})
+              if not isinstance(rss, dict):
+                rss = {}
+              channel = rss.get("channel", {})
+              if not isinstance(channel, dict):
+                channel = {}
+              items = channel.get("item", [])
               if isinstance(items,dict): items=[items]
 
-              source = "{{ fromJson(taskrun.value).feed_name }}"
-              feed_category = "{{ fromJson(taskrun.value).category }}"
+              source = "{{ fromJson(parent.taskrun.value).feed_name }}"
+              feed_category = "{{ fromJson(parent.taskrun.value).category }}"
 
               result = [{
                 "title": item.get("title"),
@@ -172,13 +318,32 @@ tasks:
                 category TEXT, keywords TEXT, description_word_count INTEGER,
                 audio_file_size_bytes BIGINT, explicit BOOLEAN, image_url TEXT
               );
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS guid                    TEXT;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS title                   TEXT;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS link                    TEXT;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS description             TEXT;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS duration                TEXT;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS duration_seconds        INTEGER;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS creator                 TEXT;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS pubDate                 TEXT;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS pub_date                TIMESTAMP;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS audio_url               TEXT;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS source                  TEXT;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS episode_number          INTEGER;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS season_number           INTEGER;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS category                TEXT;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS keywords                TEXT;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS description_word_count  INTEGER;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS audio_file_size_bytes   BIGINT;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS explicit                BOOLEAN;
+              ALTER TABLE podcast_staging ADD COLUMN IF NOT EXISTS image_url               TEXT;
               TRUNCATE TABLE podcast_staging;
 
           - id: load_staging_table
             type: io.kestra.plugin.jdbc.postgresql.CopyIn
             format: CSV
             header: true
-            from: "{{ outputs.extract_podcasts[taskrun.value].outputFiles['podcast_data.csv'] }}"
+            from: "{{ outputs.extract_podcasts[parent.taskrun.value].outputFiles['podcast_data.csv'] }}"
             table: podcast_staging
             columns:
               - guid
@@ -220,7 +385,7 @@ tasks:
             type: io.kestra.plugin.jdbc.postgresql.Queries
             sql: |
               UPDATE podcast_feeds SET last_fetched_at = NOW()
-              WHERE rss_url = '{{ fromJson(taskrun.value).rss_url }}';
+              WHERE rss_url = '{{ fromJson(parent.taskrun.value).rss_url }}';
 
         else:
           - id: log_feed_error
@@ -230,12 +395,13 @@ tasks:
                 feed_id INTEGER,
                 feed_name TEXT,
                 rss_url TEXT,
-                error_timestamp TIMESTAMP,
+                error_timestamp TIMESTAMP DEFAULT NOW(),
                 error_type TEXT,
                 UNIQUE(feed_id, error_timestamp)
               );
+              ALTER TABLE feed_fetch_failures ALTER COLUMN error_timestamp SET DEFAULT NOW();
               INSERT INTO feed_fetch_failures (feed_id, feed_name, rss_url, error_timestamp, error_type)
-              VALUES ({{ fromJson(taskrun.value).feed_id }}, '{{ fromJson(taskrun.value).feed_name }}', '{{ fromJson(taskrun.value).rss_url }}', NOW(), 'fetch_failed')
+              VALUES ({{ fromJson(parent.taskrun.value).feed_id }}, '{{ fromJson(parent.taskrun.value).feed_name }}', '{{ fromJson(parent.taskrun.value).rss_url }}', NOW(), 'fetch_failed')
               ON CONFLICT DO NOTHING;
 
   - id: update_log
@@ -304,6 +470,7 @@ pluginDefaults:
       password: "{{ secret('DB_PASSWORD') }}"
 
 triggers:
-  - id: hourly_schedule
+  - id: six_hourly_schedule
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0 * * * *"
+    cron: "0 */6 * * *"
+    recoverMissedSchedules: ALL
